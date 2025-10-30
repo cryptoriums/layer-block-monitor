@@ -18,6 +18,7 @@ evm/.deploys/
 evm/contracts/*/artifacts
 evm/node_modules
 evm/package-lock.json
+evm/.states
 build/*
 secrets.yaml
 .env

@@ -28,7 +28,7 @@ const (
 )
 
 func TestLayerUpgrade(t *testing.T) {
-	ChainUpgradeTest(t, "layer", "layer", "local", "v5.1.1")
+	ChainUpgradeTest(t, "layer", "layer", "local", "v6.0.0")
 }
 
 func ChainUpgradeTest(t *testing.T, chainName, upgradeContainerRepo, upgradeVersion, upgradeName string) {
@@ -71,8 +71,8 @@ func ChainUpgradeTest(t *testing.T, chainName, upgradeContainerRepo, upgradeVers
 				Images: []ibc.DockerImage{
 					{
 						Repository: "ghcr.io/tellor-io/layer",
-						Version:    "v5.0.0",
-						UidGid:     "1025:1025",
+						Version:    "latest",
+						UIDGID:     "1025:1025",
 					},
 				},
 				EncodingConfig:      e2e.LayerEncoding(),
@@ -192,12 +192,14 @@ func ChainUpgradeTest(t *testing.T, chainName, upgradeContainerRepo, upgradeVers
 		// Generate different values for each report
 		testValue := util.EncodeValue(float64(1000000 + i*100000))
 
+		// wait 1 block
+		require.NoError(t, testutil.WaitForBlocks(ctx, 1, validatorI))
+
 		// tip
 		_, _, err = validatorI.Exec(ctx, validatorI.TxCommand("validator", "oracle", "tip", qData, "1000000loya", "--keyring-dir", chain.HomeDir()), validatorI.Chain.Config().Env)
 		require.NoError(t, err, fmt.Sprintf("error tipping for report %d", i+1))
 
-		err = testutil.WaitForBlocks(ctx, 1, validatorI)
-		require.NoError(t, err)
+		require.NoError(t, testutil.WaitForBlocks(ctx, 1, validatorI))
 
 		// submit-value
 		_, err = validatorI.ExecTx(ctx, "validator", "oracle", "submit-value", qData, testValue, "--keyring-dir", chain.HomeDir())
@@ -250,7 +252,7 @@ func ChainUpgradeTest(t *testing.T, chainName, upgradeContainerRepo, upgradeVers
 	require.NoError(t, err, "error unmarshaling no-stake reports response")
 	fmt.Printf("Total no-stake reports found: %d\n", len(reportsResNoStake.NoStakeReports))
 	require.Equal(t, valAddr, reportsResNoStake.NoStakeReports[0].Reporter)
-	require.Equal(t, 5, len(reportsResNoStake.NoStakeReports), "Should have 5 no-stake reports after upgrade")
+	require.Equal(t, 6, len(reportsResNoStake.NoStakeReports), "Should have 6 no-stake reports after upgrade")
 
 	// Test 5: Pagination edge cases with limit
 	reports, _, err = queryWithTimeout("oracle", "get-reportsby-reporter", valAddr, "--page-limit", "5")
@@ -264,7 +266,7 @@ func ChainUpgradeTest(t *testing.T, chainName, upgradeContainerRepo, upgradeVers
 	require.NoError(t, err, "error querying reports with large limit")
 	err = json.Unmarshal(reports, &reportsRes)
 	require.NoError(t, err, "error unmarshaling reports with large limit")
-	require.Equal(t, 10, len(reportsRes.MicroReports), "Should return all 11 reports when limit is higher")
+	require.Equal(t, 11, len(reportsRes.MicroReports), "Should return all 11 reports when limit is higher")
 
 	// Test 7: Pagination with offset
 	reports, _, err = queryWithTimeout("oracle", "get-reportsby-reporter", valAddr, "--page-offset", "5", "--page-limit", "3")
@@ -306,14 +308,14 @@ func ChainUpgradeTest(t *testing.T, chainName, upgradeContainerRepo, upgradeVers
 	require.NoError(t, err, "error in compatibility test for reports")
 	err = json.Unmarshal(reports, &reportsRes)
 	require.NoError(t, err, "error unmarshaling compatibility test reports")
-	require.Equal(t, 9, len(reportsRes.MicroReports), "Compatibility test should return 10 reports")
+	require.Equal(t, 10, len(reportsRes.MicroReports), "Compatibility test should return 10 reports")
 
 	// query no stake reports with all flags
 	reports, _, err = queryWithTimeout("oracle", "get-reporters-no-stake-reports", valAddr, "--page-limit", "10", "--page-reverse", "--page-offset", "1")
 	require.NoError(t, err, "error in compatibility test for no-stake reports")
 	err = json.Unmarshal(reports, &reportsResNoStake)
 	require.NoError(t, err, "error unmarshaling compatibility test no-stake reports")
-	require.Equal(t, 4, len(reportsResNoStake.NoStakeReports), "Compatibility test should return 5 no-stake reports")
+	require.Equal(t, 5, len(reportsResNoStake.NoStakeReports), "Compatibility test should return 5 no-stake reports")
 
 	// Test individual flags for get-reportsby-reporter
 	reports, _, err = queryWithTimeout("oracle", "get-reportsby-reporter", valAddr, "--page-limit", "5")
@@ -341,14 +343,14 @@ func ChainUpgradeTest(t *testing.T, chainName, upgradeContainerRepo, upgradeVers
 	require.NoError(t, err, "error testing no-stake reports page-reverse")
 	err = json.Unmarshal(reports, &reportsResNoStake)
 	require.NoError(t, err, "error unmarshaling no-stake reports page-reverse test")
-	require.Equal(t, 5, len(reportsResNoStake.NoStakeReports), "No-stake reports page-reverse should return 5 reports")
+	require.Equal(t, 6, len(reportsResNoStake.NoStakeReports), "No-stake reports page-reverse should return 6 reports")
 
 	// query no stake reports by reporter with only page-offset flag
 	reports, _, err = queryWithTimeout("oracle", "get-reporters-no-stake-reports", valAddr, "--page-offset", "0")
 	require.NoError(t, err, "error testing no-stake reports page-offset")
 	err = json.Unmarshal(reports, &reportsResNoStake)
 	require.NoError(t, err, "error unmarshaling no-stake reports page-offset test")
-	require.Equal(t, 5, len(reportsResNoStake.NoStakeReports), "No-stake reports page-offset should return 5 reports")
+	require.Equal(t, 6, len(reportsResNoStake.NoStakeReports), "No-stake reports page-offset should return 6 reports")
 
 	// Final simple verification
 	reports, _, err = queryWithTimeout("oracle", "get-reporters-no-stake-reports", valAddr, "--page-limit", "1")

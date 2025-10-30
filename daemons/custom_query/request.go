@@ -2,14 +2,20 @@ package customquery
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	gometrics "github.com/hashicorp/go-metrics"
+	"github.com/tellor-io/layer/daemons/custom_query/combined/combined_handler"
+	"github.com/tellor-io/layer/daemons/custom_query/contracts/contract_handlers"
+	rpc_handler "github.com/tellor-io/layer/daemons/custom_query/rpc/rpc_handler"
+	"github.com/tellor-io/layer/daemons/lib/metrics"
+	pricefeedservertypes "github.com/tellor-io/layer/daemons/server/types/pricefeed"
+
+	"github.com/cosmos/cosmos-sdk/telemetry"
 )
 
 // Result holds the value returned from an endpoint
@@ -17,6 +23,8 @@ type Result struct {
 	Value      float64
 	Err        error
 	EndpointID string
+	MarketId   string
+	SourceId   string
 }
 
 // FetchPriceResult holds the result of a price fetch operation
@@ -29,24 +37,47 @@ type FetchPriceResult struct {
 }
 
 // FetchPrice fetches price data for the given query ID
-func FetchPrice(ctx context.Context, query QueryConfig) (*FetchPriceResult, error) {
+func FetchPrice(
+	ctx context.Context,
+	query QueryConfig,
+	priceCache *pricefeedservertypes.MarketToExchangePrices,
+) (*FetchPriceResult, error) {
 	// Create a context with timeout
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	fmt.Println(query)
-	results := make(chan Result, len(query.Endpoints))
+
+	totalEndpoints := len(query.RpcReaders) + len(query.ContractReaders) + len(query.CombinedReaders)
+	results := make(chan Result, totalEndpoints)
 	var wg sync.WaitGroup
 
-	// Launch a goroutine for each endpoint
-	for _, endpoint := range query.BuiltEndpoints {
+	// Launch goroutines for contract endpoints
+	for _, contractEndpoint := range query.ContractReaders {
 		wg.Add(1)
-		go func(ep BuiltEndpoint) {
+		go func(ep ContractHandler) {
 			defer wg.Done()
-			result := fetchFromEndpoint(ctx, ep)
+			result := fetchFromContractEndpoint(ctx, ep, priceCache)
 			results <- result
-		}(endpoint)
+		}(contractEndpoint)
 	}
+	// Launch goroutines for REST API endpoints
+	for _, rpchandler := range query.RpcReaders {
+		wg.Add(1)
+		go func(ep RpcHandler) {
+			defer wg.Done()
+			result := fetchFromRpcEndpoint(ctx, ep, priceCache)
+			results <- result
+		}(rpchandler)
 
+	}
+	// Launch goroutines for combined endpoints
+	for _, combinedHandler := range query.CombinedReaders {
+		wg.Add(1)
+		go func(ep CombinedHandler) {
+			defer wg.Done()
+			result := fetchFromCombinedEndpoint(ctx, ep, priceCache)
+			results <- result
+		}(combinedHandler)
+	}
 	// Close results channel when all goroutines complete
 	go func() {
 		wg.Wait()
@@ -61,6 +92,12 @@ func FetchPrice(ctx context.Context, query QueryConfig) (*FetchPriceResult, erro
 		allResults = append(allResults, result)
 		if result.Err == nil {
 			successfulResults = append(successfulResults, result)
+			// Emit metrics for successful results
+			emitPriceForTelemetry(result, query)
+			emitSuccessForTelemetry(result, query)
+		} else {
+			// Emit error metrics for failed results
+			emitErrorForTelemetry(result, query)
 		}
 	}
 	// Check if we have enough successful responses
@@ -70,7 +107,7 @@ func FetchPrice(ctx context.Context, query QueryConfig) (*FetchPriceResult, erro
 	}
 	fmt.Println("Successful results:", successfulResults)
 	// Aggregate results
-	aggregatedValue, err := aggregateResults(successfulResults, query.AggregationMethod, query.ResponseType)
+	aggregatedValue, err := aggregateResults(successfulResults, query.AggregationMethod, query.ResponseType, query.MaxSpreadPercent)
 	if err != nil {
 		return nil, err
 	}
@@ -80,135 +117,121 @@ func FetchPrice(ctx context.Context, query QueryConfig) (*FetchPriceResult, erro
 		RawResults:   allResults,
 		QueryID:      query.ID,
 		ResponseType: query.ResponseType,
-		SuccessRate:  float64(len(successfulResults)) / float64(len(query.Endpoints)),
+		SuccessRate:  float64(len(successfulResults)) / float64(totalEndpoints),
 	}, nil
 }
 
-// fetchFromEndpoint fetches data from a single endpoint
-func fetchFromEndpoint(ctx context.Context, endpoint BuiltEndpoint) Result {
-	// Create a context with the endpoint's timeout
-	timeoutDuration := time.Duration(endpoint.Timeout) * time.Millisecond
-	ctx, cancel := context.WithTimeout(ctx, timeoutDuration)
-	defer cancel()
+func emitPriceForTelemetry(result Result, query QueryConfig) {
+	telemetry.SetGaugeWithLabels(
+		[]string{metrics.PricefeedDaemon, metrics.PriceEncoderUpdatePrice},
+		float32(result.Value),
+		[]gometrics.Label{
+			metrics.GetLabelForStringValue(metrics.MarketId, result.MarketId),
+			metrics.GetLabelForStringValue(metrics.ExchangeId, result.SourceId),
+		},
+	)
+}
 
-	// Create request
-	req, err := http.NewRequestWithContext(ctx, endpoint.Method, endpoint.URL, nil)
+func emitSuccessForTelemetry(result Result, query QueryConfig) {
+	telemetry.IncrCounterWithLabels(
+		[]string{metrics.PricefeedDaemon, metrics.PriceEncoderPriceConversion, metrics.Success},
+		1.0,
+		[]gometrics.Label{
+			metrics.GetLabelForStringValue(metrics.MarketId, result.MarketId),
+			metrics.GetLabelForStringValue(metrics.ExchangeId, result.SourceId),
+		},
+	)
+}
+
+func emitErrorForTelemetry(result Result, query QueryConfig) {
+	telemetry.IncrCounterWithLabels(
+		[]string{metrics.PricefeedDaemon, metrics.PriceEncoderPriceConversion, metrics.Error},
+		1.0,
+		[]gometrics.Label{
+			metrics.GetLabelForStringValue(metrics.MarketId, result.MarketId),
+			metrics.GetLabelForStringValue(metrics.ExchangeId, result.SourceId),
+			metrics.GetLabelForStringValue(metrics.Reason, result.Err.Error()),
+		},
+	)
+}
+
+// fetchFromContractEndpoint fetches data from a smart contract
+func fetchFromContractEndpoint(
+	ctx context.Context,
+	contractReader ContractHandler,
+	priceCache *pricefeedservertypes.MarketToExchangePrices,
+) Result {
+	handler, err := contract_handlers.GetHandler(contractReader.Handler)
 	if err != nil {
 		return Result{
-			Err:        fmt.Errorf("error creating request: %w", err),
-			EndpointID: endpoint.EndpointID,
+			Err:        fmt.Errorf("failed to get contract handler: %w", err),
+			EndpointID: contractReader.Handler,
+			MarketId:   contractReader.MarketId,
+			SourceId:   contractReader.SourceId,
 		}
 	}
-	if endpoint.Headers != nil {
-		addHeaders(req, endpoint.Headers)
-	}
-	// Execute request
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	value, err := handler.FetchValue(ctx, contractReader.Reader, priceCache)
 	if err != nil {
 		return Result{
-			Err:        fmt.Errorf("request failed: %w", err),
-			EndpointID: endpoint.EndpointID,
-		}
-	}
-	defer resp.Body.Close()
-
-	// Check response status
-	if resp.StatusCode != http.StatusOK {
-		return Result{
-			Err:        fmt.Errorf("received non-OK response code: %d", resp.StatusCode),
-			EndpointID: endpoint.EndpointID,
+			Err:        fmt.Errorf("failed to fetch contract value: %w", err),
+			EndpointID: contractReader.Handler,
+			MarketId:   contractReader.MarketId,
+			SourceId:   contractReader.SourceId,
 		}
 	}
 
-	// Read response body
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return Result{
-			Err:        fmt.Errorf("error reading response body: %w", err),
-			EndpointID: endpoint.EndpointID,
-		}
-	}
+	defer contractReader.Reader.Close()
 
-	// Extract value from response according to response path
-	value, err := extractValueFromJSON(body, endpoint.ResponsePath)
-	if err != nil {
-		return Result{
-			Err:        fmt.Errorf("error extracting value: %w", err),
-			EndpointID: endpoint.EndpointID,
-		}
-	}
-
+	fmt.Println("Contract value:", value)
 	return Result{
 		Value:      value,
-		EndpointID: endpoint.EndpointID,
+		EndpointID: "contract:" + contractReader.Handler,
+		MarketId:   contractReader.MarketId,
+		SourceId:   contractReader.SourceId,
 	}
 }
 
-// extractValueFromJSON extracts a float64 value from JSON based on the given path
-func extractValueFromJSON(data []byte, path []string) (float64, error) {
-	var result interface{}
-	if err := json.Unmarshal(data, &result); err != nil {
-		return 0, fmt.Errorf("error unmarshaling JSON: %w", err)
+func fetchFromRpcEndpoint(
+	ctx context.Context,
+	rpchandler RpcHandler,
+	priceCache *pricefeedservertypes.MarketToExchangePrices,
+) Result {
+	handlerStr := rpchandler.Handler
+	if handlerStr == "" {
+		handlerStr = "generic"
 	}
 
-	// Navigate through the JSON path
-	current := result
-	for i, key := range path {
-		if current == nil {
-			return 0, fmt.Errorf("null value at path segment %d: %s", i, key)
-		}
-
-		mapValue, ok := current.(map[string]interface{})
-		if !ok {
-			// if not a map, check if it's an array
-			if currentArray, ok := current.([]interface{}); ok {
-				// Try to parse key as an index
-				index, err := strconv.Atoi(key)
-				if err != nil {
-					return 0, fmt.Errorf("expected numeric index for array, got: %s", key)
-				}
-
-				if index < 0 || index >= len(currentArray) {
-					return 0, fmt.Errorf("array index out of bounds: %d", index)
-				}
-
-				current = currentArray[index]
-				continue
-			}
-			return 0, fmt.Errorf("expected object at path segment %d: %s, got %T", i, key, current)
-		}
-
-		current, ok = mapValue[key]
-		if !ok {
-			return 0, fmt.Errorf("key not found at path segment %d: %s", i, key)
+	handler, err := rpc_handler.GetHandler(handlerStr)
+	if err != nil {
+		return Result{
+			Err:        fmt.Errorf("failed to get RPC handler: %w", err),
+			EndpointID: rpchandler.Handler,
+			MarketId:   rpchandler.MarketId,
+			SourceId:   rpchandler.SourceId,
 		}
 	}
 
-	// Convert the final value to float64
-	switch v := current.(type) {
-	case float64:
-		return v, nil
-	case float32:
-		return float64(v), nil
-	case int:
-		return float64(v), nil
-	case int64:
-		return float64(v), nil
-	case string:
-		var f float64
-		_, err := fmt.Sscanf(v, "%f", &f)
-		if err != nil {
-			return 0, fmt.Errorf("error parsing string as float: %w", err)
+	value, err := handler.FetchValue(ctx, rpchandler.Reader, rpchandler.Invert, rpchandler.UsdViaID, priceCache)
+	if err != nil {
+		return Result{
+			Err:        fmt.Errorf("failed to fetch RPC value: %w", err),
+			EndpointID: rpchandler.Handler,
+			MarketId:   rpchandler.MarketId,
+			SourceId:   rpchandler.SourceId,
 		}
-		return f, nil
-	default:
-		return 0, fmt.Errorf("unsupported value type: %T", current)
+	}
+
+	fmt.Println("RPC value:", value, rpchandler.EndpointID)
+	return Result{
+		Value:      value,
+		EndpointID: rpchandler.Handler,
+		MarketId:   rpchandler.MarketId,
+		SourceId:   rpchandler.SourceId,
 	}
 }
 
 // aggregateResults aggregates results using the specified method
-func aggregateResults(results []Result, method, responseType string) (string, error) {
+func aggregateResults(results []Result, method, responseType string, maxSpreadPercent float64) (string, error) {
 	if len(results) == 0 {
 		return "", fmt.Errorf("no results to aggregate")
 	}
@@ -221,7 +244,7 @@ func aggregateResults(results []Result, method, responseType string) (string, er
 
 	switch strings.ToLower(method) {
 	case "median":
-		return MedianInHex(values, responseType)
+		return MedianInHex(values, responseType, maxSpreadPercent)
 	// case "mode":
 	// return ModeInHex(values, responseType)
 	default:
@@ -229,12 +252,40 @@ func aggregateResults(results []Result, method, responseType string) (string, er
 	}
 }
 
-func ConvertFloat64ToString(num float64) string {
-	return strconv.FormatFloat(num, 'f', -1, 64)
+// fetchFromCombinedEndpoint fetches data using both contract and RPC sources
+func fetchFromCombinedEndpoint(
+	ctx context.Context,
+	combinedReader CombinedHandler,
+	priceCache *pricefeedservertypes.MarketToExchangePrices,
+) Result {
+	handler, err := combined_handler.GetHandler(combinedReader.Handler)
+	if err != nil {
+		return Result{
+			Err:        fmt.Errorf("failed to get combined handler: %w", err),
+			EndpointID: combinedReader.Handler,
+		}
+	}
+
+	value, err := handler.FetchValue(ctx, combinedReader.ContractReaders, combinedReader.RpcReaders, priceCache)
+	if err != nil {
+		return Result{
+			Err:        fmt.Errorf("failed to fetch combined value: %w", err),
+			EndpointID: combinedReader.Handler,
+		}
+	}
+
+	// Clean up readers
+	for _, reader := range combinedReader.ContractReaders {
+		defer reader.Close()
+	}
+
+	fmt.Println("Combined value:", value)
+	return Result{
+		Value:      value,
+		EndpointID: "combined:" + combinedReader.Handler,
+	}
 }
 
-func addHeaders(req *http.Request, headers map[string]string) {
-	for key, value := range headers {
-		req.Header.Add(key, value)
-	}
+func ConvertFloat64ToString(num float64) string {
+	return strconv.FormatFloat(num, 'f', -1, 64)
 }

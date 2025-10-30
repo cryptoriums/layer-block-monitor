@@ -45,17 +45,21 @@ var (
 	aggregateAlertCooldown   time.Time
 	// Map to store event types we're interested in
 	eventTypeMap map[string]ConfigType
+	// Supported query IDs map for asset pair lookups
+	supportedQueryIDsMap *SupportedQueryIDsMap
+	queryIDsMutex        sync.RWMutex
 	// Command line parameters
-	rpcURL              string
-	configFilePath      string
-	nodeName            string
-	blockTimeThreshold  time.Duration
-	previousBlockTime   time.Time
-	blockTimeMutex      sync.RWMutex
-	lastBlockHeight     uint64
-	isTimestampAnalyzer bool
-	currentBlockHeight  uint64
-	blockHeightMutex    sync.RWMutex
+	rpcURL                   string
+	configFilePath           string
+	supportedQueryIDsMapPath string
+	nodeName                 string
+	blockTimeThreshold       time.Duration
+	previousBlockTime        time.Time
+	blockTimeMutex           sync.RWMutex
+	lastBlockHeight          uint64
+	isTimestampAnalyzer      bool
+	currentBlockHeight       uint64
+	blockHeightMutex         sync.RWMutex
 )
 
 type Params struct {
@@ -63,10 +67,11 @@ type Params struct {
 }
 
 type ConfigType struct {
-	AlertName  string `yaml:"alert_name"`
-	AlertType  string `yaml:"alert_type"`
-	Query      string `yaml:"query"`
-	WebhookURL string `yaml:"webhook_url"`
+	AlertName   string    `yaml:"alert_name"`
+	AlertType   string    `yaml:"alert_type"`
+	Query       string    `yaml:"query"`
+	WebhookURL  string    `yaml:"webhook_url"`
+	LastAlerted time.Time `yaml:"last_alerted"`
 }
 
 type RPCRequest struct {
@@ -192,6 +197,12 @@ type BlockResultsResponse struct {
 
 type EventConfig struct {
 	EventTypes []ConfigType `yaml:"event_types"`
+}
+
+// SupportedQueryIDsMap represents the structure of the supported_query_ids_map.json file
+type SupportedQueryIDsMap struct {
+	QueryIDToAssetPairMap   map[string]string `json:"queryIdToAssetPairMap"`
+	QueryDataToAssetPairMap map[string]string `json:"queryDataToAssetPairMap"`
 }
 
 type HTTPClient struct {
@@ -326,6 +337,10 @@ func loadConfig() error {
 	// Initialize the event type map
 	newEventTypeMap := make(map[string]ConfigType)
 	for _, et := range newConfig.EventTypes {
+		// Preserve existing LastAlerted value if it exists
+		if existingConfig, exists := eventTypeMap[et.AlertType]; exists {
+			et.LastAlerted = existingConfig.LastAlerted
+		}
 		newEventTypeMap[et.AlertType] = et
 		log.Printf("Loaded event type: %s (%s)\n", et.AlertName, et.AlertType)
 	}
@@ -334,6 +349,50 @@ func loadConfig() error {
 	eventTypeMap = newEventTypeMap
 	configMutex.Unlock()
 	return nil
+}
+
+// loadSupportedQueryIDsMap loads the supported query IDs map from the JSON file
+func loadSupportedQueryIDsMap() error {
+	if supportedQueryIDsMapPath == "" {
+		return fmt.Errorf("supported query IDs map file path not provided")
+	}
+
+	data, err := os.ReadFile(supportedQueryIDsMapPath)
+	if err != nil {
+		return fmt.Errorf("error reading supported query IDs map file at %s: %w", supportedQueryIDsMapPath, err)
+	}
+
+	var newQueryIDsMap SupportedQueryIDsMap
+	if err := json.Unmarshal(data, &newQueryIDsMap); err != nil {
+		return fmt.Errorf("error parsing supported query IDs map file at %s: %w", supportedQueryIDsMapPath, err)
+	}
+
+	queryIDsMutex.Lock()
+	supportedQueryIDsMap = &newQueryIDsMap
+	queryIDsMutex.Unlock()
+
+	log.Printf("Loaded supported query IDs map from %s with %d query ID mappings and %d query data mappings\n",
+		supportedQueryIDsMapPath, len(newQueryIDsMap.QueryIDToAssetPairMap), len(newQueryIDsMap.QueryDataToAssetPairMap))
+	return nil
+}
+
+// getAssetPairFromQueryID returns the asset pair for a given query ID, or empty string if not found
+func getAssetPairFromQueryID(queryID string) string {
+	queryIDsMutex.RLock()
+	defer queryIDsMutex.RUnlock()
+
+	if supportedQueryIDsMap == nil {
+		log.Println("supportedQueryIDsMap is nil")
+		return ""
+	}
+
+	if assetPair, exists := supportedQueryIDsMap.QueryIDToAssetPairMap[queryID]; exists {
+		return assetPair
+	}
+
+	// If not found, return empty string
+	log.Println("assetPair not found")
+	return ""
 }
 
 func startConfigWatcher(ctx context.Context) {
@@ -390,6 +449,12 @@ func handleAggregateReport(event Event, eventType ConfigType) {
 						message := fmt.Sprintf("**Rate Limit Reached: %s**\nToo many alerts in the last 10 minutes. Alerts will be paused for 2 hours. Please check on reporters and see what is going on\n", eventType.AlertName)
 						for _, attr := range event.Attributes {
 							message += fmt.Sprintf("%s: %s\n", attr.Key, attr.Value)
+							if attr.Key == "query_id" {
+								assetPair := getAssetPairFromQueryID(attr.Value)
+								if assetPair != "" {
+									message += fmt.Sprintf("Asset Pair: %s\n", assetPair)
+								}
+							}
 						}
 
 						discordNotifier := utils.NewDiscordNotifier(eventType.WebhookURL)
@@ -397,6 +462,9 @@ func handleAggregateReport(event Event, eventType ConfigType) {
 							log.Printf("Error sending final Discord alert: %v\n", err)
 						} else {
 							log.Printf("Sent final Discord alert and starting cooldown\n")
+							eventConfig := eventTypeMap[eventType.AlertType]
+							eventConfig.LastAlerted = now
+							eventTypeMap[eventConfig.AlertType] = eventConfig
 						}
 
 						// Set cooldown for 2 hours
@@ -420,6 +488,9 @@ func handleAggregateReport(event Event, eventType ConfigType) {
 						// Add timestamp for this alert
 						aggregateAlertTimestamps = append(aggregateAlertTimestamps, now)
 						aggregateAlertCount++
+						eventConfig := eventTypeMap[eventType.AlertType]
+						eventConfig.LastAlerted = now
+						eventTypeMap[eventConfig.AlertType] = eventConfig
 					}
 				}
 			} else {
@@ -440,13 +511,19 @@ func MonitorBlockEvents(ctx context.Context, wg *sync.WaitGroup) {
 		return
 	}
 
+	// Load supported query IDs map
+	if err := loadSupportedQueryIDsMap(); err != nil {
+		log.Printf("Error loading supported query IDs map: %v", err)
+		return
+	}
+
 	client := NewHTTPClient(rpcURL)
 
 	// Get initial block height
 	initialHeight, err := client.getLatestBlockHeight()
 	if err != nil {
 		log.Printf("Failed to get initial block height: %v", err)
-		return
+		panic(err)
 	}
 
 	blockHeightMutex.Lock()
@@ -595,7 +672,7 @@ func processBlock(blockResponse *BlockResponse, resultsResponse *BlockResultsRes
 				blockDiff := height - lastBlockHeight
 				if blockDiff > 0 {
 					normalizedTimeDiff := time.Duration(float64(timeDiff) / float64(blockDiff))
-					fmt.Println("Normalized time per block: ", normalizedTimeDiff.String())
+					log.Println("Normalized time per block: ", normalizedTimeDiff.String())
 					if normalizedTimeDiff > blockTimeThreshold {
 						message := fmt.Sprintf("**Alert: Abnormally Long Block Time**\nNode: %s\nTime between blocks: %v\nNormalized time per block: %v\nThreshold: %v\nPrevious block time: %v\nCurrent block time: %v",
 							nodeName, timeDiff, normalizedTimeDiff, blockTimeThreshold, prevTime, currentBlockTime)
@@ -718,12 +795,20 @@ func writeTimestampToCSV(timestamp string) error {
 // Add a helper function to handle events
 func handleEvent(event Event, eventType ConfigType) {
 	if event.Type == AGGREGATE_REPORT_NAME {
-		fmt.Println("Calling handleAggregateReport")
 		handleAggregateReport(event, eventType)
 	} else {
 		message := fmt.Sprintf("**Event Alert: %s**\n", eventType.AlertName)
 		for _, attr := range event.Attributes {
 			message += fmt.Sprintf("%s: %s\n", attr.Key, attr.Value)
+			if attr.Key == "query_id" {
+				// Try to get the asset pair for this query ID
+				assetPair := getAssetPairFromQueryID(attr.Value)
+				if assetPair != "" {
+					message += fmt.Sprintf("Asset Pair: %s\n", assetPair)
+				} else {
+					message += "Asset Pair: Unknown\n"
+				}
+			}
 		}
 
 		discordNotifier := utils.NewDiscordNotifier(eventType.WebhookURL)
@@ -732,6 +817,9 @@ func handleEvent(event Event, eventType ConfigType) {
 			log.Printf("Error sending Discord alert for event %s: %v\n", event.Type, err)
 		} else {
 			log.Printf("Sent Discord alert for event: %s\n", event.Type)
+			eventConfig := eventTypeMap[eventType.AlertType]
+			eventConfig.LastAlerted = time.Now()
+			eventTypeMap[eventConfig.AlertType] = eventConfig
 		}
 	}
 
@@ -881,6 +969,7 @@ func analyzeValidatorSetUpdates(ctx context.Context) {
 }
 
 func runAnalysis() {
+	log.Printf("Running analysis")
 	// Check if CSV file exists
 	_, err := os.Stat("bridge_validator_timestamps.csv")
 	if err != nil {
@@ -923,16 +1012,16 @@ func runAnalysis() {
 		// Try RFC3339 format first
 		timestamp, parseErr = time.Parse(time.RFC3339, timestampStr)
 		if parseErr != nil {
-			// Try Unix timestamp
+			// Try Unix timestamp (assuming milliseconds)
 			if unixTime, err := strconv.ParseInt(timestampStr, 10, 64); err == nil {
-				timestamp = time.Unix(unixTime, 0)
+				timestamp = time.Unix(unixTime/1000, (unixTime%1000)*1000000)
 			} else {
 				log.Printf("Error parsing timestamp %s: %v", timestampStr, parseErr)
 				continue
 			}
 		}
-		sevenDaysAgo := time.Now().Add(-7 * 24 * time.Hour)
-		if timestamp.After(sevenDaysAgo) {
+		fourteenDaysAgo := time.Now().Add(-14 * 24 * time.Hour)
+		if timestamp.After(fourteenDaysAgo) {
 			timestamps = append(timestamps, timestamp)
 		}
 	}
@@ -942,8 +1031,56 @@ func runAnalysis() {
 		return
 	}
 
+	// Check if we have any timestamps in the last 2 weeks
+	if len(timestamps) == 0 {
+		log.Printf("No timestamps found in the last 2 weeks - this indicates an issue")
+		// Send alert about no recent timestamps
+		message := fmt.Sprintf("**Daily Validator Set Update Analysis**\n\n"+
+			"**⚠️ ALERT: No validator set updates found in the last 2 weeks**\n"+
+			"**Analysis Period:** Last 14 days\n"+
+			"**Total Updates:** 0\n"+
+			"**Status:** No recent activity detected\n"+
+			"**Node:** %s",
+			nodeName)
+
+		configMutex.RLock()
+		eventType, exists := eventTypeMap["valset_update_analysis"]
+		configMutex.RUnlock()
+
+		if exists {
+			discordNotifier := utils.NewDiscordNotifier(eventType.WebhookURL)
+			if err := discordNotifier.SendAlert(message); err != nil {
+				log.Printf("Error sending no-timestamps Discord alert: %v", err)
+			} else {
+				log.Printf("Sent no-timestamps Discord alert")
+			}
+		}
+		return
+	}
+
 	if len(timestamps) < 2 {
-		log.Printf("Not enough timestamps for analysis (need at least 2, got %d)", len(timestamps))
+		log.Printf("Only %d timestamp(s) found in the last 2 weeks (need at least 2 for frequency analysis)", len(timestamps))
+		// Send alert about insufficient data
+		message := fmt.Sprintf("**Daily Validator Set Update Analysis**\n\n"+
+			"**⚠️ ALERT: Insufficient data for frequency analysis**\n"+
+			"**Analysis Period:** Last 14 days\n"+
+			"**Total Updates:** %d\n"+
+			"**Status:** Only %d update(s) found - cannot calculate frequency\n"+
+			"**Node:** %s",
+			len(timestamps), len(timestamps), nodeName)
+
+		configMutex.RLock()
+		eventType, exists := eventTypeMap["valset_update_analysis"]
+		configMutex.RUnlock()
+
+		if exists {
+			discordNotifier := utils.NewDiscordNotifier(eventType.WebhookURL)
+			if err := discordNotifier.SendAlert(message); err != nil {
+				log.Printf("Error sending insufficient-data Discord alert: %v", err)
+			} else {
+				log.Printf("Sent insufficient-data Discord alert")
+			}
+		}
 		return
 	}
 
@@ -951,11 +1088,6 @@ func runAnalysis() {
 	sort.Slice(timestamps, func(i, j int) bool {
 		return timestamps[i].Before(timestamps[j])
 	})
-
-	if len(timestamps) < 2 {
-		log.Printf("Not enough recent timestamps for 7-day analysis (need at least 2, got %d)", len(timestamps))
-		return
-	}
 
 	// Calculate time differences
 	var timeDiffs []time.Duration
@@ -984,7 +1116,7 @@ func runAnalysis() {
 	// Format the message
 	message := fmt.Sprintf("**Daily Validator Set Update Analysis**\n\n"+
 		"**Latest Update:** %s\n"+
-		"**Analysis Period:** Last 7 days\n"+
+		"**Analysis Period:** Last 14 days\n"+
 		"**Total Updates:** %d\n"+
 		"**Average Frequency:** %s\n"+
 		"**Median Frequency:** %s\n"+
@@ -1010,6 +1142,9 @@ func runAnalysis() {
 		log.Printf("Error sending validator set analysis Discord alert: %v", err)
 	} else {
 		log.Printf("Sent daily validator set analysis Discord alert")
+		eventConfig := eventTypeMap[eventType.AlertType]
+		eventConfig.LastAlerted = time.Now()
+		eventTypeMap[eventConfig.AlertType] = eventConfig
 	}
 }
 
@@ -1032,18 +1167,114 @@ func formatDuration(d time.Duration) string {
 	}
 }
 
+// Add a helper function to check event type heartbeats
+func checkEventTypeHeartbeats(ctx context.Context) {
+	defer recoverAndAlert("checkEventTypeHeartbeats")
+
+	// Run check once a day at 10 AM
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+
+	// Calculate time until next 10 AM
+	now := time.Now()
+	nextRun := time.Date(now.Year(), now.Month(), now.Day(), 10, 0, 0, 0, now.Location())
+	if now.After(nextRun) {
+		nextRun = nextRun.Add(24 * time.Hour)
+	}
+
+	// Wait until 10 AM
+	time.Sleep(nextRun.Sub(now))
+
+	// Run initial check
+	runHeartbeatCheck()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			runHeartbeatCheck()
+		}
+	}
+}
+
+func runHeartbeatCheck() {
+	configMutex.RLock()
+	eventTypes := make(map[string]ConfigType)
+	for k, v := range eventTypeMap {
+		eventTypes[k] = v
+	}
+	configMutex.RUnlock()
+
+	sevenDaysAgo := time.Now().Add(-7 * 24 * time.Hour)
+	var inactiveEventTypes []string
+
+	// Check each event type
+	for alertType, config := range eventTypes {
+		// Skip if LastAlerted is zero (never alerted) or if it's been more than 7 days
+		if config.LastAlerted.IsZero() || config.LastAlerted.Before(sevenDaysAgo) {
+			inactiveEventTypes = append(inactiveEventTypes, alertType)
+		}
+	}
+
+	// Send individual heartbeat alerts to each inactive event type's channel
+	for _, alertType := range inactiveEventTypes {
+		config := eventTypes[alertType]
+
+		// Skip if no webhook URL is configured
+		if config.WebhookURL == "" {
+			log.Printf("No webhook URL configured for event type %s, skipping heartbeat", alertType)
+			continue
+		}
+
+		lastAlerted := "Never"
+		if !config.LastAlerted.IsZero() {
+			lastAlerted = config.LastAlerted.Format("2006-01-02 15:04:05 UTC")
+		}
+
+		message := fmt.Sprintf("**Heartbeat Alert: %s**\n\n"+
+			"This event type has not been triggered in the last 7 days.\n"+
+			"**Node:** %s\n"+
+			"**Event Type:** %s\n"+
+			"**Last Alerted:** %s\n\n"+
+			"This is a heartbeat alert to confirm that this event type is still being monitored.",
+			config.AlertName, nodeName, alertType, lastAlerted)
+
+		discordNotifier := utils.NewDiscordNotifier(config.WebhookURL)
+		if err := discordNotifier.SendAlert(message); err != nil {
+			log.Printf("Error sending heartbeat Discord alert for %s: %v", alertType, err)
+		} else {
+			log.Printf("Sent heartbeat alert for event type: %s", alertType)
+			// Update the LastAlerted timestamp for this event type
+			configMutex.Lock()
+			if eventConfig, exists := eventTypeMap[alertType]; exists {
+				eventConfig.LastAlerted = time.Now()
+				eventTypeMap[alertType] = eventConfig
+			}
+			configMutex.Unlock()
+		}
+	}
+
+	if len(inactiveEventTypes) > 0 {
+		log.Printf("Sent heartbeat alerts for %d inactive event types", len(inactiveEventTypes))
+	} else {
+		log.Printf("All event types have been alerted within the last 7 days")
+	}
+}
+
 func main() {
 	// Parse command line flags
 	flag.StringVar(&rpcURL, "rpc-url", DefaultRpcURL, "RPC URL (default: 127.0.0.1:26657)")
 	flag.StringVar(&configFilePath, "config", "", "Path to config file")
+	flag.StringVar(&supportedQueryIDsMapPath, "query-ids-map", "", "Path to supported query IDs map JSON file")
 	flag.StringVar(&nodeName, "node", "", "Name of the node being monitored")
 	flag.BoolVar(&isTimestampAnalyzer, "timestamp-analyzer", false, "Enable analyzer of validator set update timestamps")
 	flag.DurationVar(&blockTimeThreshold, "block-time-threshold", 0, "Block time threshold (e.g. 5m, 1h). If not set, block time monitoring is disabled.")
 	flag.Parse()
 
 	// Validate required parameters
-	if configFilePath == "" || nodeName == "" {
-		log.Fatal("Usage: go run ./scripts/async-monitors/async-monitor-events.go -rpc-url=<rpc_url> -config=<config_file_path> -node=<node_name>")
+	if configFilePath == "" || nodeName == "" || supportedQueryIDsMapPath == "" {
+		log.Fatal("Usage: go run ./scripts/async-monitors/async-monitor-events.go -rpc-url=<rpc_url> -config=<config_file_path> -query-ids-map=<query_ids_map_file_path> -node=<node_name>")
 	}
 
 	// Initialize Current_Total_Reporter_Power with a default value
@@ -1079,6 +1310,10 @@ func main() {
 		wg.Add(1)
 		go analyzeValidatorSetUpdates(ctx)
 	}
+
+	// Start event type heartbeat checker
+	wg.Add(1)
+	go checkEventTypeHeartbeats(ctx)
 
 	wg.Wait()
 	log.Println("Shutdown complete")
