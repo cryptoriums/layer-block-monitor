@@ -1,3 +1,8 @@
+# Cryptotiums
+.cache
+.local
+# end
+
 vue/node_modules
 vue/dist
 release/
