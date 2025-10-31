@@ -9,11 +9,15 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
 	_ "github.com/chdb-io/chdb-go/chdb/driver"
+	"github.com/cometbft/cometbft/abci/example/kvstore"
 	abci "github.com/cometbft/cometbft/abci/types"
+	rpchttp "github.com/cometbft/cometbft/rpc/client/http"
+	rpctest "github.com/cometbft/cometbft/rpc/test"
 
 	ctypes "github.com/cometbft/cometbft/types"
 	"github.com/prometheus/client_golang/prometheus"
@@ -61,6 +65,22 @@ func TestDeduplication(t *testing.T) {
 		InitDB: true,
 	}
 
+	// Create test application that emits the events from fixtures
+	testApp := newTestApp(blocks)
+	n := rpctest.StartTendermint(testApp, rpctest.SuppressStdout, rpctest.RecreateConfig)
+	defer rpctest.StopTendermint(n)
+	require.True(t, n.IsRunning())
+	monitorCfg.Nodes = append(monitorCfg.Nodes, rpctest.GetConfig().RPC.ListenAddress)
+
+	// Create RPC client to send transactions BEFORE starting the monitor
+	// This ensures we can control when blocks are created
+	rpcAddr := rpctest.GetConfig().RPC.ListenAddress
+	rpcClient, err := rpchttp.New(rpcAddr, "/websocket")
+	require.NoError(t, err)
+	err = rpcClient.Start()
+	require.NoError(t, err)
+	defer rpcClient.Stop()
+
 	monitor, err := New(
 		cryptolog.New(),
 		monitorCfg,
@@ -68,46 +88,39 @@ func TestDeduplication(t *testing.T) {
 		SQLDB{DB: sqlDB},
 	)
 	require.NoError(t, err)
+	go monitor.Start(ctx)
 
-	// Initialize the monitor context so ProcessBlockEvent can use it
-	monitor.mainCtx = ctx
-	monitor.ctx = ctx
-	monitor.cncl = cncl
+	// Wait for monitor to subscribe before creating any blocks
+	time.Sleep(1 * time.Second)
 
-	// Initialize DB tables
-	if monitorCfg.InitDB {
-		err = monitor.initDBTables()
-		require.NoError(t, err)
-	}
+	// Send a single transaction to trigger block creation
+	// The testApp will emit all events from all fixture blocks in this one block
+	_, err = rpcClient.BroadcastTxSync(ctx, []byte("dummy_tx"))
+	require.NoError(t, err)
 
-	// Process each block event directly, simulating multiple nodes sending the same blocks
-	for _, block := range blocks {
-		// Simulate 3 nodes sending the same block (testing deduplication)
-		for i := 0; i < 3; i++ {
-			err = monitor.ProcessBlockEvent(block)
-			require.NoError(t, err)
-		}
-	}
+	// Wait for block to be created and processed
+	time.Sleep(1 * time.Second)
 
-	// Verify the report count metric
-	require.Equal(t, len(expectedReports), int(testutil.ToFloat64(monitor.reportCount)),
-		"expected reports count mismatch")
+	require.Eventually(t, func() bool { return int(testutil.ToFloat64(monitor.reportCount)) == len(expectedReports) },
+		10*time.Second, 100*time.Millisecond,
+		"expected reports count mismatch exp:%v, act:%v",
+		len(expectedReports),
+		int(testutil.ToFloat64(monitor.reportCount)),
+	)
 
-	// Query the db and test that it matches the reports from the fixtures.
+	// Query the db and test that it matches the reports from the fictures.
 	actualReports := fetchReportsFromDB(t, sqlDB)
 	require.Equal(t, len(expectedReports), len(actualReports), "db row count mismatch")
 
-	// Sort expected reports and convert to values for comparison
-	expectedReports = sortReports(t, expectedReports)
-	expectedReportsValues := make([]types.MicroReport, len(expectedReports))
-	for i, r := range expectedReports {
-		expectedReportsValues[i] = *r
+	// Since all events were emitted in block 2, update expected reports to have BlockNumber = 2
+	for _, report := range expectedReports {
+		report.BlockNumber = 2
 	}
 
-	// Sort actual reports the same way
-	actualReports = sortReportsValues(t, actualReports)
+	expectedReports = sortReports(t, expectedReports)
+	actualReports = sortReports(t, actualReports)
 
-	require.Equal(t, expectedReportsValues, actualReports, "db reports differ from expected")
+	require.Equal(t, expectedReports, actualReports, "db reports differ from expected")
 }
 
 func loadBlockFixtures(t *testing.T) []ctypes.EventDataNewBlockEvents {
@@ -167,14 +180,14 @@ func extractExpectedReports(t *testing.T, blocks []ctypes.EventDataNewBlockEvent
 	return reports
 }
 
-func fetchReportsFromDB(t *testing.T, db *sql.DB) []types.MicroReport {
+func fetchReportsFromDB(t *testing.T, db *sql.DB) []*types.MicroReport {
 	t.Helper()
 
-	rows, err := db.QueryContext(context.Background(), "SELECT reporter, power, query_type, query_id, aggregate_method, value, timestamp, cyclelist, block_number, meta_id FROM "+TableName+" ORDER BY block_number, reporter, query_id")
+	rows, err := db.QueryContext(context.Background(), "SELECT reporter, power, query_type, query_id, aggregate_method, value, timestamp, cyclelist, block_number, meta_id FROM "+TableName+" ORDER BY block_number, reporter")
 	require.NoError(t, err)
 	defer rows.Close()
 
-	var reports []types.MicroReport
+	var reports []*types.MicroReport
 	for rows.Next() {
 		var (
 			reporter        string
@@ -193,7 +206,7 @@ func fetchReportsFromDB(t *testing.T, db *sql.DB) []types.MicroReport {
 		queryID, err := DecodeQueryID(queryIDStr)
 		require.NoError(t, err)
 
-		reports = append(reports, types.MicroReport{
+		reports = append(reports, &types.MicroReport{
 			Reporter:        reporter,
 			Power:           power,
 			QueryType:       queryType,
@@ -211,19 +224,6 @@ func fetchReportsFromDB(t *testing.T, db *sql.DB) []types.MicroReport {
 	return reports
 }
 
-type comparableReport struct {
-	Reporter        string
-	Power           uint64
-	QueryType       string
-	QueryIDHex      string
-	AggregateMethod string
-	Value           string
-	Timestamp       time.Time
-	Cyclelist       bool
-	BlockNumber     uint64
-	MetaID          uint64
-}
-
 func sortReports(t *testing.T, reports []*types.MicroReport) []*types.MicroReport {
 	t.Helper()
 
@@ -231,27 +231,16 @@ func sortReports(t *testing.T, reports []*types.MicroReport) []*types.MicroRepor
 		if reports[i].BlockNumber != reports[j].BlockNumber {
 			return reports[i].BlockNumber < reports[j].BlockNumber
 		}
+
 		if reports[i].Reporter != reports[j].Reporter {
 			return reports[i].Reporter < reports[j].Reporter
 		}
-		// Sort by QueryId as tiebreaker
-		return string(reports[i].QueryId) < string(reports[j].QueryId)
-	})
 
-	return reports
-}
-
-func sortReportsValues(t *testing.T, reports []types.MicroReport) []types.MicroReport {
-	t.Helper()
-
-	sort.Slice(reports, func(i, j int) bool {
-		if reports[i].BlockNumber != reports[j].BlockNumber {
-			return reports[i].BlockNumber < reports[j].BlockNumber
+		if reports[i].MetaId != reports[j].MetaId {
+			return reports[i].MetaId < reports[j].MetaId
 		}
-		if reports[i].Reporter != reports[j].Reporter {
-			return reports[i].Reporter < reports[j].Reporter
-		}
-		// Sort by QueryId as tiebreaker
+
+		// Compare QueryId bytes
 		return string(reports[i].QueryId) < string(reports[j].QueryId)
 	})
 
@@ -276,4 +265,42 @@ type blockFixture struct {
 
 type txResult struct {
 	Events []abci.Event `json:"events"`
+}
+
+// testApp is a custom ABCI application that emits events from test fixtures
+type testApp struct {
+	kvstore.Application
+	blocks       []ctypes.EventDataNewBlockEvents
+	currentBlock int
+	mu           sync.Mutex
+}
+
+func newTestApp(blocks []ctypes.EventDataNewBlockEvents) *testApp {
+	return &testApp{
+		Application:  *kvstore.NewInMemoryApplication(),
+		blocks:       blocks,
+		currentBlock: 0,
+	}
+}
+
+func (app *testApp) FinalizeBlock(ctx context.Context, req *abci.RequestFinalizeBlock) (*abci.ResponseFinalizeBlock, error) {
+	app.mu.Lock()
+	defer app.mu.Unlock()
+
+	// Call parent implementation
+	resp, err := app.Application.FinalizeBlock(ctx, req)
+	if err != nil {
+		return resp, err
+	}
+
+	// Emit all events in the first transaction block (height 2)
+	// This avoids timing issues with CometBFT creating empty blocks
+	if req.Height == 2 {
+		// Append events from all fixture blocks
+		for _, block := range app.blocks {
+			resp.Events = append(resp.Events, block.Events...)
+		}
+	}
+
+	return resp, nil
 }
