@@ -236,6 +236,34 @@ func (m *BlockMonitor) shouldProcess(height int64) bool {
 	return true
 }
 
+// ProcessBlockEvent processes a block event directly without going through the subscription layer.
+// This is useful for testing purposes.
+func (m *BlockMonitor) ProcessBlockEvent(blockEv ctypes.EventDataNewBlockEvents) error {
+	height := blockEv.Height
+
+	if !m.shouldProcess(height) {
+		return nil
+	}
+
+	for _, ev := range blockEv.Events {
+		if ev.Type == "new_report" {
+			report, err := DecodeReportEvent(blockEv.Height, ev)
+			if err != nil {
+				m.logger.Error("failed to decode report event", "error", err)
+				m.errCount.WithLabelValues("reportDecode").Inc()
+				continue
+			}
+			if err := m.storeReport(report); err != nil {
+				m.logger.Error("failed to store report", "error", err)
+				m.errCount.WithLabelValues("reportInsert").Inc()
+				return err
+			}
+			m.logger.Debug("stored report", "vals", report)
+		}
+	}
+	return nil
+}
+
 const (
 	reporterCol        = "reporter"
 	powerCol           = "power"

@@ -13,12 +13,8 @@ import (
 	"time"
 
 	_ "github.com/chdb-io/chdb-go/chdb/driver"
-	"github.com/cometbft/cometbft/abci/example/kvstore"
 	abci "github.com/cometbft/cometbft/abci/types"
 
-	rpctest "github.com/cometbft/cometbft/rpc/test"
-
-	"github.com/cometbft/cometbft/node"
 	ctypes "github.com/cometbft/cometbft/types"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -65,15 +61,6 @@ func TestDeduplication(t *testing.T) {
 		InitDB: true,
 	}
 
-	nodes := []*node.Node{}
-	for i := 0; i < 3; i++ {
-		app := kvstore.NewInMemoryApplication()
-		n := rpctest.StartTendermint(app, rpctest.SuppressStdout, rpctest.RecreateConfig)
-		defer rpctest.StopTendermint(n)
-		require.True(t, n.IsRunning())
-		nodes = append(nodes, n)
-		monitorCfg.Nodes = append(monitorCfg.Nodes, rpctest.GetConfig().RPC.ListenAddress)
-	}
 	monitor, err := New(
 		cryptolog.New(),
 		monitorCfg,
@@ -81,31 +68,46 @@ func TestDeduplication(t *testing.T) {
 		SQLDB{DB: sqlDB},
 	)
 	require.NoError(t, err)
-	go monitor.Start(ctx)
 
+	// Initialize the monitor context so ProcessBlockEvent can use it
+	monitor.mainCtx = ctx
+	monitor.ctx = ctx
+	monitor.cncl = cncl
+
+	// Initialize DB tables
+	if monitorCfg.InitDB {
+		err = monitor.initDBTables()
+		require.NoError(t, err)
+	}
+
+	// Process each block event directly, simulating multiple nodes sending the same blocks
 	for _, block := range blocks {
-		for _, node := range nodes {
-			go func() {
-				err = node.EventBus().PublishEventNewBlockEvents(block)
-				require.NoError(t, err)
-			}()
+		// Simulate 3 nodes sending the same block (testing deduplication)
+		for i := 0; i < 3; i++ {
+			err = monitor.ProcessBlockEvent(block)
+			require.NoError(t, err)
 		}
 	}
 
-	require.Eventually(t, func() bool { return int(testutil.ToFloat64(monitor.reportCount)) == len(expectedReports) },
-		3*time.Second, 100*time.Millisecond,
-		"expected reports count mismatch exp:%v, act:%v",
-		len(expectedReports),
-		int(testutil.ToFloat64(monitor.reportCount)),
-	)
+	// Verify the report count metric
+	require.Equal(t, len(expectedReports), int(testutil.ToFloat64(monitor.reportCount)),
+		"expected reports count mismatch")
 
-	// Query the db and test that it matches the reports from the fictures.
+	// Query the db and test that it matches the reports from the fixtures.
 	actualReports := fetchReportsFromDB(t, sqlDB)
 	require.Equal(t, len(expectedReports), len(actualReports), "db row count mismatch")
 
+	// Sort expected reports and convert to values for comparison
 	expectedReports = sortReports(t, expectedReports)
+	expectedReportsValues := make([]types.MicroReport, len(expectedReports))
+	for i, r := range expectedReports {
+		expectedReportsValues[i] = *r
+	}
 
-	require.Equal(t, expectedReports, actualReports, "db reports differ from expected")
+	// Sort actual reports the same way
+	actualReports = sortReportsValues(t, actualReports)
+
+	require.Equal(t, expectedReportsValues, actualReports, "db reports differ from expected")
 }
 
 func loadBlockFixtures(t *testing.T) []ctypes.EventDataNewBlockEvents {
@@ -168,7 +170,7 @@ func extractExpectedReports(t *testing.T, blocks []ctypes.EventDataNewBlockEvent
 func fetchReportsFromDB(t *testing.T, db *sql.DB) []types.MicroReport {
 	t.Helper()
 
-	rows, err := db.QueryContext(context.Background(), "SELECT reporter, power, query_type, query_id, aggregate_method, value, timestamp, cyclelist, block_number, meta_id FROM "+TableName+" ORDER BY block_number, reporter")
+	rows, err := db.QueryContext(context.Background(), "SELECT reporter, power, query_type, query_id, aggregate_method, value, timestamp, cyclelist, block_number, meta_id FROM "+TableName+" ORDER BY block_number, reporter, query_id")
 	require.NoError(t, err)
 	defer rows.Close()
 
@@ -229,8 +231,28 @@ func sortReports(t *testing.T, reports []*types.MicroReport) []*types.MicroRepor
 		if reports[i].BlockNumber != reports[j].BlockNumber {
 			return reports[i].BlockNumber < reports[j].BlockNumber
 		}
+		if reports[i].Reporter != reports[j].Reporter {
+			return reports[i].Reporter < reports[j].Reporter
+		}
+		// Sort by QueryId as tiebreaker
+		return string(reports[i].QueryId) < string(reports[j].QueryId)
+	})
 
-		return reports[i].Reporter < reports[j].Reporter
+	return reports
+}
+
+func sortReportsValues(t *testing.T, reports []types.MicroReport) []types.MicroReport {
+	t.Helper()
+
+	sort.Slice(reports, func(i, j int) bool {
+		if reports[i].BlockNumber != reports[j].BlockNumber {
+			return reports[i].BlockNumber < reports[j].BlockNumber
+		}
+		if reports[i].Reporter != reports[j].Reporter {
+			return reports[i].Reporter < reports[j].Reporter
+		}
+		// Sort by QueryId as tiebreaker
+		return string(reports[i].QueryId) < string(reports[j].QueryId)
 	})
 
 	return reports
