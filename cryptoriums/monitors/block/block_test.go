@@ -16,7 +16,6 @@ import (
 	_ "github.com/chdb-io/chdb-go/chdb/driver"
 	"github.com/cometbft/cometbft/abci/example/kvstore"
 	abci "github.com/cometbft/cometbft/abci/types"
-	rpchttp "github.com/cometbft/cometbft/rpc/client/http"
 	rpctest "github.com/cometbft/cometbft/rpc/test"
 
 	ctypes "github.com/cometbft/cometbft/types"
@@ -65,21 +64,18 @@ func TestDeduplication(t *testing.T) {
 		InitDB: true,
 	}
 
-	// Create test application that emits the events from fixtures
+	// Create a single test node with the test app
 	testApp := newTestApp(blocks)
 	n := rpctest.StartTendermint(testApp, rpctest.SuppressStdout, rpctest.RecreateConfig)
 	defer rpctest.StopTendermint(n)
 	require.True(t, n.IsRunning())
-	monitorCfg.Nodes = append(monitorCfg.Nodes, rpctest.GetConfig().RPC.ListenAddress)
 
-	// Create RPC client to send transactions BEFORE starting the monitor
-	// This ensures we can control when blocks are created
+	// Configure monitor to connect to the same node 3 times (simulating redundancy)
+	// In production, you'd have 3 RPC endpoints pointing to the same blockchain
+	// This tests that when the same block event arrives via multiple subscriptions,
+	// the deduplication logic (shouldProcess) prevents duplicate processing
 	rpcAddr := rpctest.GetConfig().RPC.ListenAddress
-	rpcClient, err := rpchttp.New(rpcAddr, "/websocket")
-	require.NoError(t, err)
-	err = rpcClient.Start()
-	require.NoError(t, err)
-	defer rpcClient.Stop()
+	monitorCfg.Nodes = []string{rpcAddr, rpcAddr, rpcAddr}
 
 	monitor, err := New(
 		cryptolog.New(),
@@ -90,17 +86,12 @@ func TestDeduplication(t *testing.T) {
 	require.NoError(t, err)
 	go monitor.Start(ctx)
 
-	// Wait for monitor to subscribe before creating any blocks
-	time.Sleep(1 * time.Second)
+	// Wait for monitor to subscribe and process blocks
+	time.Sleep(2 * time.Second)
 
-	// Send a single transaction to trigger block creation
-	// The testApp will emit all events from all fixture blocks in this one block
-	_, err = rpcClient.BroadcastTxSync(ctx, []byte("dummy_tx"))
-	require.NoError(t, err)
-
-	// Wait for block to be created and processed
-	time.Sleep(1 * time.Second)
-
+	// We have 3 subscriptions to the same node (simulating redundancy)
+	// The same block events arrive via 3 different WebSocket connections
+	// The deduplication logic (shouldProcess) ensures they're only processed once
 	require.Eventually(t, func() bool { return int(testutil.ToFloat64(monitor.reportCount)) == len(expectedReports) },
 		10*time.Second, 100*time.Millisecond,
 		"expected reports count mismatch exp:%v, act:%v",
@@ -110,7 +101,7 @@ func TestDeduplication(t *testing.T) {
 
 	// Query the db and test that it matches the reports from the fictures.
 	actualReports := fetchReportsFromDB(t, sqlDB)
-	require.Equal(t, len(expectedReports), len(actualReports), "db row count mismatch")
+	require.Equal(t, len(expectedReports), len(actualReports), "db row count mismatch (deduplication failed)")
 
 	// Since all events were emitted in block 2, update expected reports to have BlockNumber = 2
 	for _, report := range expectedReports {
