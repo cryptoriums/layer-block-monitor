@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -16,7 +17,6 @@ import (
 	_ "github.com/chdb-io/chdb-go/chdb/driver"
 	"github.com/cometbft/cometbft/abci/example/kvstore"
 	abci "github.com/cometbft/cometbft/abci/types"
-	"github.com/cometbft/cometbft/node"
 	rpctest "github.com/cometbft/cometbft/rpc/test"
 
 	ctypes "github.com/cometbft/cometbft/types"
@@ -46,6 +46,19 @@ func TestMissingBlock(t *testing.T) {
 }
 
 func TestDeduplication(t *testing.T) {
+	// Test deduplication with 3 separate nodes (independent blockchains)
+	// Each node emits the same 4 blocks at heights 5, 6, 7, 8
+	// Deduplication ensures each height is processed only once (first node to emit wins)
+	//
+	// Fixtures contain 4 blocks:
+	// - height 5: 10 "new_report" events (from fixture block 0, height 11042385)
+	// - height 6: no events (from fixture block 1, height 11042386)
+	// - height 7: 10 "new_report" events (from fixture block 2, height 11042387)
+	// - height 8: no events (from fixture block 3, height 11042388)
+	//
+	// Expected: 20 reports total (10 from height 5 + 10 from height 7)
+	// Even though 3 nodes emit events, deduplication processes each height only once
+
 	ctx, cncl := context.WithCancel(context.Background())
 	t.Cleanup(cncl)
 
@@ -55,32 +68,41 @@ func TestDeduplication(t *testing.T) {
 
 	blocks := loadBlockFixtures(t)
 	require.NotEmpty(t, blocks)
+	require.Len(t, blocks, 4, "fixtures should contain 4 blocks")
 
-	expectedReports := extractExpectedReports(t, blocks)
+	// Map original fixture heights to emit heights
+	// Block 0 (11042385) → height 5
+	// Block 1 (11042386) → height 6
+	// Block 2 (11042387) → height 7
+	// Block 3 (11042388) → height 8
+	heightMapping := map[int64]int64{
+		11042385: 5,
+		11042386: 6,
+		11042387: 7,
+		11042388: 8,
+	}
+	expectedReports := extractExpectedReports(t, blocks, heightMapping)
 	require.NotEmpty(t, expectedReports)
+	require.Len(t, expectedReports, 20, "fixtures should contain 20 total reports")
 
+	// Create monitor configuration
 	monitorCfg := Config{
-		Nodes:  []string{},
 		InitDB: true,
 	}
 
 	// Create 3 separate nodes for redundancy testing
 	// Each node is an independent CometBFT instance with its own test app
 	// Following the client's requirement: 3 different nodes with different RPC addresses
-	nodes := make([]*node.Node, 3)
 	for i := 0; i < 3; i++ {
 		app := newTestApp(blocks)
 		n := rpctest.StartTendermint(app, rpctest.SuppressStdout, rpctest.RecreateConfig)
 		defer rpctest.StopTendermint(n)
 		require.True(t, n.IsRunning())
-		nodes[i] = n
 
-		// Get the RPC address for this node
-		// IMPORTANT: Must capture the address immediately after starting each node
-		// because rpctest.GetConfig() returns the config of the most recently started node
-		rpcAddr := rpctest.GetConfig().RPC.ListenAddress
-		monitorCfg.Nodes = append(monitorCfg.Nodes, rpcAddr)
-		t.Logf("Started node %d with RPC address: %s", i, rpcAddr)
+		// Use n.Config().RPC.ListenAddress (not rpctest.GetConfig().RPC.ListenAddress)
+		// This gets the correct RPC address for this specific node
+		monitorCfg.Nodes = append(monitorCfg.Nodes, n.Config().RPC.ListenAddress)
+		t.Logf("Started node %d with RPC address: %s", i, n.Config().RPC.ListenAddress)
 	}
 
 	monitor, err := New(
@@ -92,78 +114,39 @@ func TestDeduplication(t *testing.T) {
 	require.NoError(t, err)
 	go monitor.Start(ctx)
 
-	// Wait for monitor to subscribe to all nodes
-	time.Sleep(2 * time.Second)
+	// Wait for monitor to process all events from all 3 nodes
+	// Use require.Eventually instead of time.Sleep
+	// Expected: 20 reports total (10 from height 5 + 10 from height 7)
+	// With 3 nodes, deduplication should ensure each block is processed only once
+	expectedReportCount := 20
 
-	// IMPORTANT: With 3 independent blockchains, the deduplication logic behaves differently
-	// than with 3 RPC endpoints serving the same blockchain:
-	//
-	// - Each node creates blocks independently at its own pace
-	// - All 3 nodes emit events on blocks 5-20
-	// - The shouldProcess() method uses a GLOBAL lastHeight variable
-	// - When Node 1 processes height 5, lastHeight becomes 5
-	// - When Node 2 tries to process height 5, it's rejected (5 <= 5)
-	// - Same for Node 3
-	//
-	// Result: Only the FIRST node to reach each height gets processed
-	// In practice, we observe ~60 reports (3 blocks × 20 events)
-	//
-	// This demonstrates that:
-	// 1. We successfully connected to 3 DIFFERENT node addresses ✓
-	// 2. The deduplication logic works (height-based) ✓
-	// 3. The current implementation is designed for "multiple RPC endpoints → same blockchain"
-	//    not "multiple independent blockchains"
+	require.Eventually(t, func() bool {
+		actualReports := fetchReportsFromDB(t, sqlDB)
+		return len(actualReports) == expectedReportCount
+	}, 10*time.Second, 500*time.Millisecond, "should receive exactly %d reports", expectedReportCount)
 
-	// Wait for some reports to be processed
-	time.Sleep(3 * time.Second)
-
-	// Query the db and test that it matches the reports from the fixtures
+	// Verify final report count
 	actualReports := fetchReportsFromDB(t, sqlDB)
-	require.Greater(t, len(actualReports), 0, "should have received some reports from the 3 nodes")
+	t.Logf("Received %d total reports (expected %d)", len(actualReports), expectedReportCount)
+	require.Equal(t, expectedReportCount, len(actualReports), "should have exactly 20 reports (10 from each of 2 blocks with events)")
 
-	// Since we get reports from multiple blocks (heights 5-20), we expect multiples of 20
-	// Each block emits all 20 events from the fixtures
-	require.Equal(t, 0, len(actualReports)%len(expectedReports),
-		"report count should be a multiple of %d (fixture events per block)", len(expectedReports))
-
-	// Update expected reports to match the block numbers we actually received
-	// All events are emitted with the same structure, just at different heights
-	numBlocks := len(actualReports) / len(expectedReports)
-
-	// Sort actual reports to see what block numbers we got
-	actualReports = sortReports(t, actualReports)
-
-	// Extract unique block numbers from actual reports
-	blockNumbersMap := make(map[uint64]bool)
+	// Verify reports are from the correct heights (5 and 7)
+	// Note: Fixture data has events at heights 11042385 and 11042387 (blocks 0 and 2)
+	heightCounts := make(map[uint64]int)
 	for _, report := range actualReports {
-		blockNumbersMap[report.BlockNumber] = true
-	}
-	var blockNumbers []uint64
-	for bn := range blockNumbersMap {
-		blockNumbers = append(blockNumbers, bn)
-	}
-	sort.Slice(blockNumbers, func(i, j int) bool { return blockNumbers[i] < blockNumbers[j] })
-
-	t.Logf("Received reports from %d blocks: %v", len(blockNumbers), blockNumbers)
-
-	// Build expected reports based on the actual block numbers we received
-	var allExpectedReports []*types.MicroReport
-	for _, blockNum := range blockNumbers {
-		for _, report := range expectedReports {
-			// Create a copy with the block number set to the height where it was emitted
-			expectedCopy := *report
-			expectedCopy.BlockNumber = blockNum
-			allExpectedReports = append(allExpectedReports, &expectedCopy)
-		}
+		heightCounts[report.BlockNumber]++
 	}
 
-	allExpectedReports = sortReports(t, allExpectedReports)
+	require.Equal(t, 10, heightCounts[5], "should have 10 reports from height 5")
+	require.Equal(t, 10, heightCounts[7], "should have 10 reports from height 7")
+	require.Len(t, heightCounts, 2, "should have reports from exactly 2 heights")
 
-	require.Equal(t, allExpectedReports, actualReports, "db reports differ from expected")
+	// Verify reports match expected fixture data
+	actualReports = sortReports(t, actualReports)
+	expectedReports = sortReports(t, expectedReports)
+	require.Equal(t, expectedReports, actualReports, "db reports should match expected fixture reports")
 
-	t.Logf("Successfully connected to 3 different nodes and received %d reports from %d blocks",
-		len(actualReports), numBlocks)
-	t.Logf("Node addresses: %v", monitorCfg.Nodes)
+	t.Logf("Successfully verified deduplication with 3 separate nodes")
 }
 
 func loadBlockFixtures(t *testing.T) []ctypes.EventDataNewBlockEvents {
@@ -203,7 +186,7 @@ func loadBlockFixtures(t *testing.T) []ctypes.EventDataNewBlockEvents {
 	return out
 }
 
-func extractExpectedReports(t *testing.T, blocks []ctypes.EventDataNewBlockEvents) []*types.MicroReport {
+func extractExpectedReports(t *testing.T, blocks []ctypes.EventDataNewBlockEvents, heightMapping map[int64]int64) []*types.MicroReport {
 	t.Helper()
 
 	var reports []*types.MicroReport
@@ -213,7 +196,9 @@ func extractExpectedReports(t *testing.T, blocks []ctypes.EventDataNewBlockEvent
 				continue
 			}
 
-			report, err := DecodeReportEvent(block.Height, ev)
+			// Use the mapped height instead of the original fixture height
+			emitHeight := heightMapping[block.Height]
+			report, err := DecodeReportEvent(emitHeight, ev)
 			require.NoError(t, err)
 
 			reports = append(reports, report)
@@ -311,18 +296,17 @@ type txResult struct {
 }
 
 // testApp is a custom ABCI application that emits events from test fixtures
+// at their original heights
 type testApp struct {
 	kvstore.Application
-	blocks       []ctypes.EventDataNewBlockEvents
-	currentBlock int
-	mu           sync.Mutex
+	blocks []ctypes.EventDataNewBlockEvents
+	mu     sync.Mutex
 }
 
 func newTestApp(blocks []ctypes.EventDataNewBlockEvents) *testApp {
 	return &testApp{
-		Application:  *kvstore.NewInMemoryApplication(),
-		blocks:       blocks,
-		currentBlock: 0,
+		Application: *kvstore.NewInMemoryApplication(),
+		blocks:      blocks,
 	}
 }
 
@@ -336,13 +320,20 @@ func (app *testApp) FinalizeBlock(ctx context.Context, req *abci.RequestFinalize
 		return resp, err
 	}
 
-	// Emit events on every block between height 5 and 20
-	// This gives the monitor time to subscribe (after the 2-second sleep)
-	// and ensures it catches enough events for testing
-	if req.Height >= 5 && req.Height <= 20 {
-		// Append events from all fixture blocks
-		for _, block := range app.blocks {
+	// Emit events at low heights (5, 6, 7, 8) instead of original fixture heights
+	// Fixtures contain 4 blocks:
+	// - block 0 (originally height 11042385): 10 "new_report" events → emit at height 5
+	// - block 1 (originally height 11042386): no txs → emit at height 6
+	// - block 2 (originally height 11042387): no txs → emit at height 7
+	// - block 3 (originally height 11042388): 10 "new_report" events → emit at height 8
+	emitHeights := []int64{5, 6, 7, 8}
+	for i, block := range app.blocks {
+		if req.Height == emitHeights[i] {
 			resp.Events = append(resp.Events, block.Events...)
+			if len(block.Events) > 0 {
+				println(fmt.Sprintf("TEST APP: Emitting %d events at height %d", len(block.Events), req.Height))
+			}
+			break
 		}
 	}
 
