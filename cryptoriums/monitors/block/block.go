@@ -172,7 +172,6 @@ retryLoop:
 					}
 					return
 				case msg, ok := <-eventCh:
-					m.logger.Debug("new event", msg)
 					if !ok {
 						m.logger.Error("event channel closed", "node", node)
 						ctx, cncl := context.WithTimeout(context.Background(), time.Second)
@@ -200,7 +199,7 @@ retryLoop:
 
 					for _, ev := range blockEv.Events {
 						if ev.Type == "new_report" {
-							report, err := DecodeReportEvent(blockEv.Height, ev)
+							report, err := DecodeReportEvent(uint64(blockEv.Height), ev)
 							if err != nil {
 								m.logger.Error("failed to decode report event", "error", err)
 								m.errCount.WithLabelValues("reportDecode").Inc()
@@ -238,7 +237,7 @@ func (m *BlockMonitor) shouldProcess(height int64) bool {
 
 const (
 	reporterCol        = "reporter"
-	powerCol           = "power"
+	powerCol           = "reporter_power"
 	queryTypeCol       = "query_type"
 	queryIdCol         = "query_id"
 	aggregateMethodCol = "aggregate_method"
@@ -406,15 +405,17 @@ func DecodeQueryID(val string) ([]byte, error) {
 }
 
 // DecodeReportEvent extracts a MicroReport from a CometBFT event payload.
-func DecodeReportEvent(height int64, ev abci.Event) (*types.MicroReport, error) {
+func DecodeReportEvent(height uint64, ev abci.Event) (*types.MicroReport, error) {
 	var report types.MicroReport
+
+	report.BlockNumber = height
 
 	for _, attr := range ev.Attributes {
 		attrVal := string(attr.Value)
 		switch attr.Key {
 		case reporterCol:
 			report.Reporter = attrVal
-		case powerCol, "reporter_power":
+		case powerCol:
 			power, err := ParseReporterPower(attrVal)
 			if err != nil {
 				return nil, fmt.Errorf("parse reporter power: %w", err)
@@ -440,16 +441,6 @@ func DecodeReportEvent(height int64, ev abci.Event) (*types.MicroReport, error) 
 			report.Timestamp = ts
 		case cyclelistCol:
 			report.Cyclelist = attrVal == "true"
-		case blockNumberCol:
-			blockNumber, err := ParseBlockNumber(attrVal)
-			if err != nil {
-				return nil, fmt.Errorf("parse block number: %w", err)
-			}
-			report.BlockNumber = blockNumber
-
-			if report.BlockNumber == 0 && height > 0 {
-				report.BlockNumber = uint64(height)
-			}
 		case metaIdCol:
 			metaId, err := ParseMetaID(attrVal)
 			if err != nil {
@@ -457,11 +448,6 @@ func DecodeReportEvent(height int64, ev abci.Event) (*types.MicroReport, error) 
 			}
 			report.MetaId = metaId
 		}
-	}
-
-	// If block_number attribute was not present in the event, use the height parameter
-	if report.BlockNumber == 0 && height > 0 {
-		report.BlockNumber = uint64(height)
 	}
 
 	return &report, nil

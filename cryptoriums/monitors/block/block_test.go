@@ -5,11 +5,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +17,7 @@ import (
 	_ "github.com/chdb-io/chdb-go/chdb/driver"
 	"github.com/cometbft/cometbft/abci/example/kvstore"
 	abci "github.com/cometbft/cometbft/abci/types"
+	"github.com/cometbft/cometbft/node"
 	rpctest "github.com/cometbft/cometbft/rpc/test"
 
 	ctypes "github.com/cometbft/cometbft/types"
@@ -45,45 +46,30 @@ func TestMissingBlock(t *testing.T) {
 
 }
 
+// Test deduplication with few separate nodes (independent blockchains)
+// Each node emits the same blocks
+// Deduplication ensures each height is processed only once (first node to emit wins)
+// Even though the nodes emit the same events multiple times, deduplication processes each height only once
 func TestDeduplication(t *testing.T) {
-	// Test deduplication with 3 separate nodes (independent blockchains)
-	// Each node emits the same 4 blocks at heights 5, 6, 7, 8
-	// Deduplication ensures each height is processed only once (first node to emit wins)
-	//
-	// Fixtures contain 4 blocks:
-	// - height 5: 10 "new_report" events (from fixture block 0, height 11042385)
-	// - height 6: no events (from fixture block 1, height 11042386)
-	// - height 7: 10 "new_report" events (from fixture block 2, height 11042387)
-	// - height 8: no events (from fixture block 3, height 11042388)
-	//
-	// Expected: 20 reports total (10 from height 5 + 10 from height 7)
-	// Even though 3 nodes emit events, deduplication processes each height only once
 
 	ctx, cncl := context.WithCancel(context.Background())
 	t.Cleanup(cncl)
 
 	sqlDB, err := sql.Open("chdb", "")
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = sqlDB.Close() })
+	t.Cleanup(func() {
+		if err = sqlDB.Close(); err != nil {
+			t.Log("closing the db", "err", err)
+		}
+	})
 
-	blocks := loadBlockFixtures(t)
-	require.NotEmpty(t, blocks)
-	require.Len(t, blocks, 4, "fixtures should contain 4 blocks")
+	eventsMap, startHeight := loadFixtureEvents(t)
+	require.NotEmpty(t, eventsMap)
 
-	// Map original fixture heights to emit heights
-	// Block 0 (11042385) → height 5
-	// Block 1 (11042386) → height 6
-	// Block 2 (11042387) → height 7
-	// Block 3 (11042388) → height 8
-	heightMapping := map[int64]int64{
-		11042385: 5,
-		11042386: 6,
-		11042387: 7,
-		11042388: 8,
-	}
-	expectedReports := extractExpectedReports(t, blocks, heightMapping)
+	expectedReports := extractExpectedReports(t, eventsMap)
 	require.NotEmpty(t, expectedReports)
-	require.Len(t, expectedReports, 20, "fixtures should contain 20 total reports")
+	expectedReportCount := 20
+	require.Len(t, expectedReports, expectedReportCount, "fixtures should contain 20 total reports")
 
 	// Create monitor configuration
 	monitorCfg := Config{
@@ -93,21 +79,22 @@ func TestDeduplication(t *testing.T) {
 	// Create 3 separate nodes for redundancy testing
 	// Each node is an independent CometBFT instance with its own test app
 	// Following the client's requirement: 3 different nodes with different RPC addresses
+	var nodes []*node.Node
 	for i := 0; i < 3; i++ {
-		app := newTestApp(blocks)
-		n := rpctest.StartTendermint(app, rpctest.SuppressStdout, rpctest.RecreateConfig)
-		defer rpctest.StopTendermint(n)
-		require.True(t, n.IsRunning())
-<<<<<<< HEAD
-		nodes = append(nodes, n)
-		monitorCfg.Nodes = append(monitorCfg.Nodes, n.Config().RPC.ListenAddress)
-=======
+		app := newTestApp(eventsMap)
+		cfg := rpctest.GetConfig(true) // force a fresh config/root dir
+		genDoc, err := ctypes.GenesisDocFromFile(cfg.GenesisFile())
+		require.NoError(t, err)
 
-		// Use n.Config().RPC.ListenAddress (not rpctest.GetConfig().RPC.ListenAddress)
-		// This gets the correct RPC address for this specific node
+		genDoc.InitialHeight = startHeight
+		err = genDoc.SaveAs(cfg.GenesisFile())
+		require.NoError(t, err)
+		n := rpctest.StartTendermint(app)
+		t.Cleanup(func() { rpctest.StopTendermint(n) })
+		nodes = append(nodes, n)
+
 		monitorCfg.Nodes = append(monitorCfg.Nodes, n.Config().RPC.ListenAddress)
 		t.Logf("Started node %d with RPC address: %s", i, n.Config().RPC.ListenAddress)
->>>>>>> origin
 	}
 
 	monitor, err := New(
@@ -121,106 +108,109 @@ func TestDeduplication(t *testing.T) {
 
 	// Wait for monitor to process all events from all 3 nodes
 	// Use require.Eventually instead of time.Sleep
-	// Expected: 20 reports total (10 from height 5 + 10 from height 7)
 	// With 3 nodes, deduplication should ensure each block is processed only once
-	expectedReportCount := 20
 
+	var actualReportsCount int
 	require.Eventually(t, func() bool {
 		actualReports := fetchReportsFromDB(t, sqlDB)
-		return len(actualReports) == expectedReportCount
-	}, 10*time.Second, 500*time.Millisecond, "should receive exactly %d reports", expectedReportCount)
+		actualReportsCount = len(actualReports)
+		return actualReportsCount == expectedReportCount
+	}, 5*time.Second, 500*time.Millisecond, "should receive exactly %d reports, but received:%v", expectedReportCount, actualReportsCount)
 
 	// Verify final report count
 	actualReports := fetchReportsFromDB(t, sqlDB)
 	t.Logf("Received %d total reports (expected %d)", len(actualReports), expectedReportCount)
-	require.Equal(t, expectedReportCount, len(actualReports), "should have exactly 20 reports (10 from each of 2 blocks with events)")
-
-	// Verify reports are from the correct heights (5 and 7)
-	// Note: Fixture data has events at heights 11042385 and 11042387 (blocks 0 and 2)
-	heightCounts := make(map[uint64]int)
-	for _, report := range actualReports {
-		heightCounts[report.BlockNumber]++
-	}
-
-	require.Equal(t, 10, heightCounts[5], "should have 10 reports from height 5")
-	require.Equal(t, 10, heightCounts[7], "should have 10 reports from height 7")
-	require.Len(t, heightCounts, 2, "should have reports from exactly 2 heights")
+	require.Equal(t, expectedReportCount, len(actualReports), "should have exactly %v reports in the db", len(actualReports))
 
 	// Verify reports match expected fixture data
 	actualReports = sortReports(t, actualReports)
 	expectedReports = sortReports(t, expectedReports)
 	require.Equal(t, expectedReports, actualReports, "db reports should match expected fixture reports")
-
-	t.Logf("Successfully verified deduplication with 3 separate nodes")
 }
 
-func loadBlockFixtures(t *testing.T) []ctypes.EventDataNewBlockEvents {
+type blockFixture struct {
+	Height              string       `json:"height"`
+	TxsResults          []txResult   `json:"txs_results"`
+	FinalizeBlockEvents []abci.Event `json:"finalize_block_events"`
+}
+
+type txResult struct {
+	Events []abci.Event `json:"events"`
+}
+
+func loadFixtureEvents(t *testing.T) (map[int64][]abci.Event, int64) {
 	t.Helper()
 
 	path := fixturePath(t, "test_blocks.json")
 	data, err := os.ReadFile(path)
 	require.NoError(t, err)
 
+	minHeight := int64(math.MaxInt64)
+
 	var fixtures []blockFixture
 	require.NoError(t, json.Unmarshal(data, &fixtures))
 
-	out := make([]ctypes.EventDataNewBlockEvents, 0, len(fixtures))
+	out := make(map[int64][]abci.Event)
 	for _, fixture := range fixtures {
-		height, err := strconv.ParseInt(fixture.Height, 10, 64)
-		require.NoError(t, err)
-
-		var events []abci.Event
 		for _, txRes := range fixture.TxsResults {
-			if len(txRes.Events) > 0 {
-				events = append(events, txRes.Events...)
+			height, err := ParseBlockNumber(fixture.Height)
+			require.NoError(t, err)
+			if height < uint64(minHeight) {
+				minHeight = int64(height)
 			}
+			out[int64(height)] = append(out[int64(height)], txRes.Events...)
 		}
-
-		// Almost every other block don't contain TxsResults. Should we skip those or use the FinalizeBlockEvents?
-		// if len(fixture.FinalizeBlockEvents) > 0 {
-		// 	events = append(events, fixture.FinalizeBlockEvents...)
-		// }
-
-		out = append(out, ctypes.EventDataNewBlockEvents{
-			Height: height,
-			Events: events,
-			NumTxs: int64(len(fixture.TxsResults)),
-		})
 	}
 
-	return out
+	return out, minHeight
 }
 
-func extractExpectedReports(t *testing.T, blocks []ctypes.EventDataNewBlockEvents, heightMapping map[int64]int64) []*types.MicroReport {
+func extractExpectedReports(t *testing.T, eventsMap map[int64][]abci.Event) []types.MicroReport {
 	t.Helper()
 
-	var reports []*types.MicroReport
-	for _, block := range blocks {
-		for _, ev := range block.Events {
+	var reports []types.MicroReport
+	for height, events := range eventsMap {
+		for _, ev := range events {
 			if ev.Type != "new_report" {
 				continue
 			}
-
-			// Use the mapped height instead of the original fixture height
-			emitHeight := heightMapping[block.Height]
-			report, err := DecodeReportEvent(emitHeight, ev)
+			report, err := DecodeReportEvent(uint64(height), ev)
 			require.NoError(t, err)
 
-			reports = append(reports, report)
+			reports = append(reports, *report)
 		}
 	}
 
 	return reports
 }
 
-func fetchReportsFromDB(t *testing.T, db *sql.DB) []*types.MicroReport {
+func fetchReportsFromDB(t *testing.T, db *sql.DB) []types.MicroReport {
 	t.Helper()
 
-	rows, err := db.QueryContext(context.Background(), "SELECT reporter, power, query_type, query_id, aggregate_method, value, timestamp, cyclelist, block_number, meta_id FROM "+TableName+" ORDER BY block_number, reporter")
+	query := fmt.Sprintf(
+		"SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s FROM %s ORDER BY %s, %s",
+		reporterCol,
+		powerCol,
+		queryTypeCol,
+		queryIdCol,
+		aggregateMethodCol,
+		valueCol,
+		timestampCol,
+		cyclelistCol,
+		blockNumberCol,
+		metaIdCol,
+		TableName,
+		blockNumberCol,
+		reporterCol,
+	)
+
+	ctx, cncl := context.WithTimeout(context.Background(), time.Second)
+	defer cncl()
+	rows, err := db.QueryContext(ctx, query)
 	require.NoError(t, err)
 	defer rows.Close()
 
-	var reports []*types.MicroReport
+	var reports []types.MicroReport
 	for rows.Next() {
 		var (
 			reporter        string
@@ -239,7 +229,7 @@ func fetchReportsFromDB(t *testing.T, db *sql.DB) []*types.MicroReport {
 		queryID, err := DecodeQueryID(queryIDStr)
 		require.NoError(t, err)
 
-		reports = append(reports, &types.MicroReport{
+		reports = append(reports, types.MicroReport{
 			Reporter:        reporter,
 			Power:           power,
 			QueryType:       queryType,
@@ -257,7 +247,7 @@ func fetchReportsFromDB(t *testing.T, db *sql.DB) []*types.MicroReport {
 	return reports
 }
 
-func sortReports(t *testing.T, reports []*types.MicroReport) []*types.MicroReport {
+func sortReports(t *testing.T, reports []types.MicroReport) []types.MicroReport {
 	t.Helper()
 
 	sort.Slice(reports, func(i, j int) bool {
@@ -290,28 +280,18 @@ func fixturePath(t *testing.T, name string) string {
 	return filepath.Join(dir, name)
 }
 
-type blockFixture struct {
-	Height              string       `json:"height"`
-	TxsResults          []txResult   `json:"txs_results"`
-	FinalizeBlockEvents []abci.Event `json:"finalize_block_events"`
-}
-
-type txResult struct {
-	Events []abci.Event `json:"events"`
-}
-
 // testApp is a custom ABCI application that emits events from test fixtures
 // at their original heights
 type testApp struct {
 	kvstore.Application
-	blocks []ctypes.EventDataNewBlockEvents
-	mu     sync.Mutex
+	eventsMap map[int64][]abci.Event
+	mu        sync.Mutex
 }
 
-func newTestApp(blocks []ctypes.EventDataNewBlockEvents) *testApp {
+func newTestApp(eventsMap map[int64][]abci.Event) *testApp {
 	return &testApp{
 		Application: *kvstore.NewInMemoryApplication(),
-		blocks:      blocks,
+		eventsMap:   eventsMap,
 	}
 }
 
@@ -325,20 +305,9 @@ func (app *testApp) FinalizeBlock(ctx context.Context, req *abci.RequestFinalize
 		return resp, err
 	}
 
-	// Emit events at low heights (5, 6, 7, 8) instead of original fixture heights
-	// Fixtures contain 4 blocks:
-	// - block 0 (originally height 11042385): 10 "new_report" events → emit at height 5
-	// - block 1 (originally height 11042386): no txs → emit at height 6
-	// - block 2 (originally height 11042387): no txs → emit at height 7
-	// - block 3 (originally height 11042388): 10 "new_report" events → emit at height 8
-	emitHeights := []int64{5, 6, 7, 8}
-	for i, block := range app.blocks {
-		if req.Height == emitHeights[i] {
-			resp.Events = append(resp.Events, block.Events...)
-			if len(block.Events) > 0 {
-				println(fmt.Sprintf("TEST APP: Emitting %d events at height %d", len(block.Events), req.Height))
-			}
-			break
+	if len(app.eventsMap[req.Height]) > 0 {
+		for _, event := range app.eventsMap[req.Height] {
+			resp.Events = append(resp.Events, event)
 		}
 	}
 
