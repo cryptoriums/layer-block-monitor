@@ -61,15 +61,11 @@ type BlockMonitor struct {
 	lastHeight  int64
 	mtx         sync.Mutex
 
-	mainCtx context.Context
-
-	ctx  context.Context
-	cncl context.CancelFunc
-
 	readyCh chan struct{}
 }
 
 func New(logger log.Logger, cfg Config, reg prometheus.Registerer, db Db) (*BlockMonitor, error) {
+
 	errCount := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 		Namespace: cryptoriums.MetricsNamespace,
 		Subsystem: ComponentName,
@@ -95,31 +91,19 @@ func New(logger log.Logger, cfg Config, reg prometheus.Registerer, db Db) (*Bloc
 	return monitor, nil
 }
 
-func (m *BlockMonitor) ReloadCfg(cfg Config) {
-
-	m.cncl()
-	m.cfg = cfg
-
-	go m.Start(m.mainCtx)
-}
-
 func (m *BlockMonitor) Start(ctx context.Context) error {
-	m.mainCtx = ctx
-	ctx, cncl := context.WithCancel(ctx)
-	m.ctx = ctx
-	m.cncl = cncl
-
 	if m.cfg.InitDB {
-		if err := m.initDBTables(); err != nil {
+		if err := m.initDBTables(ctx); err != nil {
 			return err
 		}
 	}
+
 	var wg sync.WaitGroup
 	for _, node := range m.cfg.Nodes {
 		wg.Add(1)
 		go func(node string) {
 			defer wg.Done()
-			m.subscribeNode(node)
+			m.subscribeNode(ctx, node)
 		}(node)
 	}
 	<-ctx.Done()
@@ -138,7 +122,7 @@ func (m *BlockMonitor) IsReady() {
 	}
 }
 
-func (m *BlockMonitor) subscribeNode(node string) {
+func (m *BlockMonitor) subscribeNode(ctx context.Context, node string) {
 	retryInterval := time.Second * 2
 	ticker := time.NewTicker(retryInterval)
 	defer ticker.Stop()
@@ -146,7 +130,7 @@ func (m *BlockMonitor) subscribeNode(node string) {
 retryLoop:
 	for {
 		select {
-		case <-m.ctx.Done():
+		case <-ctx.Done():
 			return
 		default:
 			client, err := rpchttp.New(node, "/websocket")
@@ -164,7 +148,7 @@ retryLoop:
 			m.logger.Info("subscribed", "node", node+"/websocket")
 
 			query := ctypes.QueryForEvent(ctypes.EventNewBlockEvents).String()
-			eventCh, err := client.Subscribe(m.ctx, ComponentName, query)
+			eventCh, err := client.Subscribe(ctx, ComponentName, query)
 			if err != nil {
 				m.logger.Error("failed to subscribe to NewBlock", "node", node, "error", err)
 				client.Stop()
@@ -176,7 +160,7 @@ retryLoop:
 
 			for {
 				select {
-				case <-m.ctx.Done():
+				case <-ctx.Done():
 					ctx, cncl := context.WithTimeout(context.Background(), time.Second)
 					defer cncl()
 					if err := client.Unsubscribe(ctx, ComponentName, query); err != nil {
@@ -220,7 +204,7 @@ retryLoop:
 								m.errCount.WithLabelValues("reportDecode").Inc()
 								continue
 							}
-							if err := m.storeReport(report); err == nil {
+							if err := m.storeReport(ctx, report); err == nil {
 								m.logger.Debug("stored report", "query", query, "vals", report)
 								continue
 							}
@@ -263,8 +247,8 @@ const (
 	metaIdCol          = "meta_id"
 )
 
-func (m *BlockMonitor) initDBTables() error {
-	ctx, cancel := context.WithTimeout(m.ctx, 5*time.Second)
+func (m *BlockMonitor) initDBTables(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	// If TableName is "db.table", create DB first.
@@ -316,8 +300,8 @@ func (m *BlockMonitor) initDBTables() error {
 	return err
 }
 
-func (m *BlockMonitor) storeReport(r *types.MicroReport) error {
-	ctx, cancel := context.WithTimeout(m.ctx, 10*time.Millisecond)
+func (m *BlockMonitor) storeReport(ctx context.Context, r *types.MicroReport) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
 	defer cancel()
 
 	var cycle uint8
