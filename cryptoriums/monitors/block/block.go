@@ -459,5 +459,10 @@ func DecodeReportEvent(height int64, ev abci.Event) (*types.MicroReport, error) 
 		}
 	}
 
+	// If block_number attribute was not present in the event, use the height parameter
+	if report.BlockNumber == 0 && height > 0 {
+		report.BlockNumber = uint64(height)
+	}
+
 	return &report, nil
 }
