@@ -72,7 +72,7 @@ func TestDeduplication(t *testing.T) {
 		defer rpctest.StopTendermint(n)
 		require.True(t, n.IsRunning())
 		nodes = append(nodes, n)
-		monitorCfg.Nodes = append(monitorCfg.Nodes, rpctest.GetConfig().RPC.ListenAddress)
+		monitorCfg.Nodes = append(monitorCfg.Nodes, n.Config().RPC.ListenAddress)
 	}
 	monitor, err := New(
 		cryptolog.New(),
