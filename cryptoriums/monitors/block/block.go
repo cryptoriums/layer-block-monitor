@@ -65,6 +65,8 @@ type BlockMonitor struct {
 
 	ctx  context.Context
 	cncl context.CancelFunc
+
+	readyCh chan struct{}
 }
 
 func New(logger log.Logger, cfg Config, reg prometheus.Registerer, db Db) (*BlockMonitor, error) {
@@ -87,6 +89,7 @@ func New(logger log.Logger, cfg Config, reg prometheus.Registerer, db Db) (*Bloc
 		db:          db,
 		errCount:    errCount,
 		reportCount: reportCount,
+		readyCh:     make(chan struct{}, len(cfg.Nodes)),
 	}
 
 	return monitor, nil
@@ -125,6 +128,16 @@ func (m *BlockMonitor) Start(ctx context.Context) error {
 	return nil
 }
 
+func (m *BlockMonitor) IsReady() {
+	var count int
+	for range m.readyCh {
+		count++
+		if count == len(m.cfg.Nodes) {
+			return
+		}
+	}
+}
+
 func (m *BlockMonitor) subscribeNode(node string) {
 	retryInterval := time.Second * 2
 	ticker := time.NewTicker(retryInterval)
@@ -158,6 +171,8 @@ retryLoop:
 				<-ticker.C
 				continue
 			}
+
+			m.readyCh <- struct{}{}
 
 			for {
 				select {

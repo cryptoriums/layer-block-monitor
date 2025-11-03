@@ -17,7 +17,6 @@ import (
 	_ "github.com/chdb-io/chdb-go/chdb/driver"
 	"github.com/cometbft/cometbft/abci/example/kvstore"
 	abci "github.com/cometbft/cometbft/abci/types"
-	"github.com/cometbft/cometbft/node"
 	rpctest "github.com/cometbft/cometbft/rpc/test"
 
 	ctypes "github.com/cometbft/cometbft/types"
@@ -63,10 +62,10 @@ func TestDeduplication(t *testing.T) {
 		}
 	})
 
-	eventsMap, startHeight := loadFixtureEvents(t)
-	require.NotEmpty(t, eventsMap)
+	txsMap, startHeight := loadFixtureTxs(t)
+	require.NotEmpty(t, txsMap)
 
-	expectedReports := extractExpectedReports(t, eventsMap)
+	expectedReports := extractExpectedReports(t, txsMap)
 	require.NotEmpty(t, expectedReports)
 	expectedReportCount := 20
 	require.Len(t, expectedReports, expectedReportCount, "fixtures should contain 20 total reports")
@@ -79,9 +78,11 @@ func TestDeduplication(t *testing.T) {
 	// Create 3 separate nodes for redundancy testing
 	// Each node is an independent CometBFT instance with its own test app
 	// Following the client's requirement: 3 different nodes with different RPC addresses
-	var nodes []*node.Node
+	var apps []*testApp
 	for i := 0; i < 3; i++ {
-		app := newTestApp(eventsMap)
+		app := newTestApp(txsMap)
+		apps = append(apps, app)
+
 		cfg := rpctest.GetConfig(true) // force a fresh config/root dir
 		genDoc, err := ctypes.GenesisDocFromFile(cfg.GenesisFile())
 		require.NoError(t, err)
@@ -89,9 +90,9 @@ func TestDeduplication(t *testing.T) {
 		genDoc.InitialHeight = startHeight
 		err = genDoc.SaveAs(cfg.GenesisFile())
 		require.NoError(t, err)
+
 		n := rpctest.StartTendermint(app)
 		t.Cleanup(func() { rpctest.StopTendermint(n) })
-		nodes = append(nodes, n)
 
 		monitorCfg.Nodes = append(monitorCfg.Nodes, n.Config().RPC.ListenAddress)
 		t.Logf("Started node %d with RPC address: %s", i, n.Config().RPC.ListenAddress)
@@ -106,10 +107,15 @@ func TestDeduplication(t *testing.T) {
 	require.NoError(t, err)
 	go monitor.Start(ctx)
 
+	monitor.IsReady()
+
+	for _, app := range apps {
+		app.AllowEvents()
+	}
+
 	// Wait for monitor to process all events from all 3 nodes
 	// Use require.Eventually instead of time.Sleep
-	// With 3 nodes, deduplication should ensure each block is processed only once
-
+	// With multiple nodes, deduplication should ensure each block is processed only once
 	var actualReportsCount int
 	require.Eventually(t, func() bool {
 		actualReports := fetchReportsFromDB(t, sqlDB)
@@ -129,16 +135,12 @@ func TestDeduplication(t *testing.T) {
 }
 
 type blockFixture struct {
-	Height              string       `json:"height"`
-	TxsResults          []txResult   `json:"txs_results"`
-	FinalizeBlockEvents []abci.Event `json:"finalize_block_events"`
+	Height              string              `json:"height"`
+	TxsResults          []abci.ExecTxResult `json:"txs_results"`
+	FinalizeBlockEvents []abci.Event        `json:"finalize_block_events"`
 }
 
-type txResult struct {
-	Events []abci.Event `json:"events"`
-}
-
-func loadFixtureEvents(t *testing.T) (map[int64][]abci.Event, int64) {
+func loadFixtureTxs(t *testing.T) (map[int64][]abci.ExecTxResult, int64) {
 	t.Helper()
 
 	path := fixturePath(t, "test_blocks.json")
@@ -150,34 +152,35 @@ func loadFixtureEvents(t *testing.T) (map[int64][]abci.Event, int64) {
 	var fixtures []blockFixture
 	require.NoError(t, json.Unmarshal(data, &fixtures))
 
-	out := make(map[int64][]abci.Event)
+	out := make(map[int64][]abci.ExecTxResult)
 	for _, fixture := range fixtures {
-		for _, txRes := range fixture.TxsResults {
-			height, err := ParseBlockNumber(fixture.Height)
-			require.NoError(t, err)
-			if height < uint64(minHeight) {
-				minHeight = int64(height)
-			}
-			out[int64(height)] = append(out[int64(height)], txRes.Events...)
+		height, err := ParseBlockNumber(fixture.Height)
+		require.NoError(t, err)
+		if height < uint64(minHeight) {
+			minHeight = int64(height)
 		}
+		out[int64(height)] = append(out[int64(height)], fixture.TxsResults...)
 	}
 
 	return out, minHeight
 }
 
-func extractExpectedReports(t *testing.T, eventsMap map[int64][]abci.Event) []types.MicroReport {
+func extractExpectedReports(t *testing.T, txsMap map[int64][]abci.ExecTxResult) []types.MicroReport {
 	t.Helper()
 
 	var reports []types.MicroReport
-	for height, events := range eventsMap {
-		for _, ev := range events {
-			if ev.Type != "new_report" {
-				continue
-			}
-			report, err := DecodeReportEvent(uint64(height), ev)
-			require.NoError(t, err)
+	for height, txs := range txsMap {
+		for _, tx := range txs {
+			for _, ev := range tx.Events {
 
-			reports = append(reports, *report)
+				if ev.Type != "new_report" {
+					continue
+				}
+				report, err := DecodeReportEvent(uint64(height), ev)
+				require.NoError(t, err)
+
+				reports = append(reports, *report)
+			}
 		}
 	}
 
@@ -284,18 +287,30 @@ func fixturePath(t *testing.T, name string) string {
 // at their original heights
 type testApp struct {
 	kvstore.Application
-	eventsMap map[int64][]abci.Event
-	mu        sync.Mutex
+	txs   map[int64][]abci.ExecTxResult
+	mu    sync.Mutex
+	ready chan struct{}
 }
 
-func newTestApp(eventsMap map[int64][]abci.Event) *testApp {
+func newTestApp(txs map[int64][]abci.ExecTxResult) *testApp {
 	return &testApp{
 		Application: *kvstore.NewInMemoryApplication(),
-		eventsMap:   eventsMap,
+		txs:         txs,
+		ready:       make(chan struct{}),
+	}
+}
+
+func (app *testApp) AllowEvents() {
+	select {
+	case <-app.ready:
+	default:
+		close(app.ready)
 	}
 }
 
 func (app *testApp) FinalizeBlock(ctx context.Context, req *abci.RequestFinalizeBlock) (*abci.ResponseFinalizeBlock, error) {
+	<-app.ready
+
 	app.mu.Lock()
 	defer app.mu.Unlock()
 
@@ -305,9 +320,9 @@ func (app *testApp) FinalizeBlock(ctx context.Context, req *abci.RequestFinalize
 		return resp, err
 	}
 
-	if len(app.eventsMap[req.Height]) > 0 {
-		for _, event := range app.eventsMap[req.Height] {
-			resp.Events = append(resp.Events, event)
+	if len(app.txs[req.Height]) > 0 {
+		for _, tx := range app.txs[req.Height] {
+			resp.Events = append(resp.Events, tx.Events...)
 		}
 	}
 
