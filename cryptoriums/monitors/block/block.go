@@ -23,10 +23,12 @@ import (
 )
 
 const (
-	ComponentName     = "block_monitor"
-	MetricErrCount    = "errors_total"
-	MetricReportCount = "reports_total"
-	TableName         = "reports"
+	ComponentName       = "block_monitor"
+	MetricErrCount      = "errors_total"
+	MetricReportCount   = "reports_total"
+	TableName           = "reports"
+	ReasonOpenDisputes  = "there are open disputes so not safe to continue reporting, if the open disputes are safe to ignore add their IDs in the config"
+	ReasonTooManyErrors = "too many consecutive errors querying dispute endpoints"
 )
 
 type SQLDB struct{ *sql.DB }
@@ -48,11 +50,12 @@ type Db interface {
 }
 
 type Config struct {
-	Nodes  []string `yaml:"nodes"`
-	InitDB bool     `yaml:"initDB"`
+	Nodes          []string `yaml:"nodes"`
+	InitDB         bool     `yaml:"initDB"`
+	IgnoreDisputes []uint64
 }
 
-type BlockMonitor struct {
+type Monitor struct {
 	cfg         Config
 	logger      log.Logger
 	db          Db
@@ -64,7 +67,7 @@ type BlockMonitor struct {
 	readyCh chan struct{}
 }
 
-func New(logger log.Logger, cfg Config, reg prometheus.Registerer, db Db) (*BlockMonitor, error) {
+func New(logger log.Logger, cfg Config, reg prometheus.Registerer, db Db) (*Monitor, error) {
 
 	errCount := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 		Namespace: cryptoriums.MetricsNamespace,
@@ -79,7 +82,7 @@ func New(logger log.Logger, cfg Config, reg prometheus.Registerer, db Db) (*Bloc
 		Name:      MetricReportCount,
 		Help:      "Reports inserted into ClickHouse",
 	})
-	monitor := &BlockMonitor{
+	monitor := &Monitor{
 		cfg:         cfg,
 		logger:      logger.With("component", ComponentName),
 		db:          db,
@@ -91,7 +94,7 @@ func New(logger log.Logger, cfg Config, reg prometheus.Registerer, db Db) (*Bloc
 	return monitor, nil
 }
 
-func (m *BlockMonitor) Start(ctx context.Context) error {
+func (m *Monitor) Start(ctx context.Context) error {
 	if m.cfg.InitDB {
 		if err := m.initDBTables(ctx); err != nil {
 			return err
@@ -112,7 +115,7 @@ func (m *BlockMonitor) Start(ctx context.Context) error {
 	return nil
 }
 
-func (m *BlockMonitor) IsReady() {
+func (m *Monitor) IsReady() {
 	var count int
 	for range m.readyCh {
 		count++
@@ -122,7 +125,7 @@ func (m *BlockMonitor) IsReady() {
 	}
 }
 
-func (m *BlockMonitor) subscribeNode(ctx context.Context, node string) {
+func (m *Monitor) subscribeNode(ctx context.Context, node string) {
 	retryInterval := time.Second * 2
 	ticker := time.NewTicker(retryInterval)
 	defer ticker.Stop()
@@ -197,7 +200,36 @@ retryLoop:
 					}
 
 					for _, ev := range blockEv.Events {
-						if ev.Type == "new_report" {
+						switch ev.Type {
+						case "new_dispute":
+							m.mtx.Lock()
+							cfg := m.cfg
+							m.mtx.Unlock()
+
+							var disputeID uint64
+							for _, attr := range ev.Attributes {
+								attrVal := string(attr.Value)
+
+								if attr.Key == "dispute_id" {
+									disputeID, err = ParseDisputeID(attrVal)
+									if err != nil {
+										panic("parsing dispute ID")
+									}
+								}
+							}
+
+							var noPanic bool
+							for _, ignoreID := range cfg.IgnoreDisputes {
+								if ignoreID == disputeID {
+									noPanic = true
+									break
+								}
+							}
+							if !noPanic {
+								panic(ReasonOpenDisputes)
+							}
+
+						case "new_report":
 							report, err := DecodeReportEvent(uint64(blockEv.Height), ev)
 							if err != nil {
 								m.logger.Error("failed to decode report event", "error", err)
@@ -218,7 +250,7 @@ retryLoop:
 	}
 }
 
-func (m *BlockMonitor) shouldProcess(height int64) bool {
+func (m *Monitor) shouldProcess(height int64) bool {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 
@@ -247,7 +279,7 @@ const (
 	metaIdCol          = "meta_id"
 )
 
-func (m *BlockMonitor) initDBTables(ctx context.Context) error {
+func (m *Monitor) initDBTables(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
@@ -300,7 +332,7 @@ func (m *BlockMonitor) initDBTables(ctx context.Context) error {
 	return err
 }
 
-func (m *BlockMonitor) storeReport(ctx context.Context, r *types.MicroReport) error {
+func (m *Monitor) storeReport(ctx context.Context, r *types.MicroReport) error {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
 	defer cancel()
 
@@ -352,6 +384,11 @@ func (m *BlockMonitor) storeReport(ctx context.Context, r *types.MicroReport) er
 	m.reportCount.Inc()
 
 	return nil
+}
+
+// ParseDisputeID converts decimal strings to uint64.
+func ParseDisputeID(val string) (uint64, error) {
+	return strconv.ParseUint(val, 10, 64)
 }
 
 // ParseTimestamp parses timestamps stored on chain into UTC time.
