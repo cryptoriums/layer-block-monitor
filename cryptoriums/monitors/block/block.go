@@ -52,7 +52,7 @@ type Config struct {
 	InitDB bool     `yaml:"initDB"`
 }
 
-type BlockMonitor struct {
+type Monitor struct {
 	cfg         Config
 	logger      log.Logger
 	db          Db
@@ -61,13 +61,17 @@ type BlockMonitor struct {
 	lastHeight  int64
 	mtx         sync.Mutex
 
-	mainCtx context.Context
+	processedHeights map[int64]struct{}
+	heightQueue      []int64
 
-	ctx  context.Context
-	cncl context.CancelFunc
+	activeSubscriptions int
+
+	subscriptionCancels map[string]context.CancelFunc
+
+	readyCh chan struct{}
 }
 
-func New(logger log.Logger, cfg Config, reg prometheus.Registerer, db Db) (*BlockMonitor, error) {
+func New(logger log.Logger, cfg Config, reg prometheus.Registerer, db Db) (*Monitor, error) {
 	errCount := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 		Namespace: cryptoriums.MetricsNamespace,
 		Subsystem: ComponentName,
@@ -81,33 +85,24 @@ func New(logger log.Logger, cfg Config, reg prometheus.Registerer, db Db) (*Bloc
 		Name:      MetricReportCount,
 		Help:      "Reports inserted into ClickHouse",
 	})
-	monitor := &BlockMonitor{
-		cfg:         cfg,
-		logger:      logger.With("component", ComponentName),
-		db:          db,
-		errCount:    errCount,
-		reportCount: reportCount,
+	monitor := &Monitor{
+		cfg:                 cfg,
+		logger:              logger.With("component", ComponentName),
+		db:                  db,
+		errCount:            errCount,
+		reportCount:         reportCount,
+		processedHeights:    make(map[int64]struct{}),
+		subscriptionCancels: make(map[string]context.CancelFunc),
+		readyCh:             make(chan struct{}, len(cfg.Nodes)),
 	}
 
 	return monitor, nil
 }
 
-func (m *BlockMonitor) ReloadCfg(cfg Config) {
-
-	m.cncl()
-	m.cfg = cfg
-
-	go m.Start(m.mainCtx)
-}
-
-func (m *BlockMonitor) Start(ctx context.Context) error {
-	m.mainCtx = ctx
-	ctx, cncl := context.WithCancel(ctx)
-	m.ctx = ctx
-	m.cncl = cncl
+func (m *Monitor) Start(ctx context.Context) error {
 
 	if m.cfg.InitDB {
-		if err := m.initDBTables(); err != nil {
+		if err := m.initDBTables(ctx); err != nil {
 			return err
 		}
 	}
@@ -116,7 +111,7 @@ func (m *BlockMonitor) Start(ctx context.Context) error {
 		wg.Add(1)
 		go func(node string) {
 			defer wg.Done()
-			m.subscribeNode(node)
+			m.subscribeNode(ctx, node)
 		}(node)
 	}
 	<-ctx.Done()
@@ -125,7 +120,61 @@ func (m *BlockMonitor) Start(ctx context.Context) error {
 	return nil
 }
 
-func (m *BlockMonitor) subscribeNode(node string) {
+func (m *Monitor) IsReady() {
+	var count int
+	for range m.readyCh {
+		count++
+		if count == len(m.cfg.Nodes) {
+			return
+		}
+	}
+}
+
+// ActiveSubscriptions returns the number of node subscriptions that are currently connected.
+func (m *Monitor) ActiveSubscriptions() int {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+	return m.activeSubscriptions
+}
+
+func (m *Monitor) subscriptionActivated() {
+	m.mtx.Lock()
+	m.activeSubscriptions++
+	m.mtx.Unlock()
+}
+
+func (m *Monitor) subscriptionDeactivated() {
+	m.mtx.Lock()
+	if m.activeSubscriptions > 0 {
+		m.activeSubscriptions--
+	}
+	m.mtx.Unlock()
+}
+
+func (m *Monitor) setSubscriptionCancel(node string, cancel context.CancelFunc) {
+	m.mtx.Lock()
+	m.subscriptionCancels[node] = cancel
+	m.mtx.Unlock()
+}
+
+func (m *Monitor) clearSubscriptionCancel(node string) {
+	m.mtx.Lock()
+	delete(m.subscriptionCancels, node)
+	m.mtx.Unlock()
+}
+
+// DropSubscription forces the monitor to close the subscription to a node.
+// Primarily used in tests to simulate a connection failure.
+func (m *Monitor) DropSubscription(node string) {
+	m.mtx.Lock()
+	cancel, ok := m.subscriptionCancels[node]
+	m.mtx.Unlock()
+	if ok {
+		cancel()
+	}
+}
+
+func (m *Monitor) subscribeNode(ctx context.Context, node string) {
 	retryInterval := time.Second * 2
 	ticker := time.NewTicker(retryInterval)
 	defer ticker.Stop()
@@ -133,7 +182,7 @@ func (m *BlockMonitor) subscribeNode(node string) {
 retryLoop:
 	for {
 		select {
-		case <-m.ctx.Done():
+		case <-ctx.Done():
 			return
 		default:
 			client, err := rpchttp.New(node, "/websocket")
@@ -143,46 +192,134 @@ retryLoop:
 				continue
 			}
 
+			nodeCtx, nodeCancel := context.WithCancel(ctx)
+			m.setSubscriptionCancel(node, nodeCancel)
+
 			if err := client.Start(); err != nil {
 				m.logger.Error("failed to start CometBFT RPC client", "node", node, "error", err)
+				nodeCancel()
+				m.clearSubscriptionCancel(node)
 				<-ticker.C
 				continue
 			}
 			m.logger.Info("subscribed", "node", node+"/websocket")
 
 			query := ctypes.QueryForEvent(ctypes.EventNewBlockEvents).String()
-			eventCh, err := client.Subscribe(m.ctx, ComponentName, query)
+			eventCh, err := client.Subscribe(nodeCtx, ComponentName, query)
 			if err != nil {
 				m.logger.Error("failed to subscribe to NewBlock", "node", node, "error", err)
 				client.Stop()
+				nodeCancel()
+				m.clearSubscriptionCancel(node)
 				<-ticker.C
 				continue
 			}
 
+			m.readyCh <- struct{}{}
+			m.subscriptionActivated()
+			active := true
+
+			healthCtx, healthCancel := context.WithCancel(nodeCtx)
+			healthErrCh := make(chan struct{}, 1)
+			go func() {
+				ticker := time.NewTicker(time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-healthCtx.Done():
+						return
+					case <-ticker.C:
+						statusCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+						_, err := client.Status(statusCtx)
+						cancel()
+						if err != nil {
+							select {
+							case healthErrCh <- struct{}{}:
+							default:
+							}
+							return
+						}
+					}
+				}
+			}()
+
 			for {
 				select {
-				case <-m.ctx.Done():
+				case <-ctx.Done():
+					if active {
+						m.subscriptionDeactivated()
+						active = false
+					}
+					healthCancel()
 					ctx, cncl := context.WithTimeout(context.Background(), time.Second)
-					defer cncl()
 					if err := client.Unsubscribe(ctx, ComponentName, query); err != nil {
 						m.logger.Error("unsubscribing the client", "err", err)
 					}
+					cncl()
 					if err := client.Stop(); err != nil {
 						m.logger.Error("stopping client", "err", err)
 					}
+					nodeCancel()
+					m.clearSubscriptionCancel(node)
 					return
+				case <-nodeCtx.Done():
+					// Parent context will be handled above; skip if that's the case.
+					if ctx.Err() != nil {
+						continue
+					}
+					if active {
+						m.subscriptionDeactivated()
+						active = false
+					}
+					healthCancel()
+					ctx, cncl := context.WithTimeout(context.Background(), time.Second)
+					if err := client.Unsubscribe(ctx, ComponentName, query); err != nil {
+						m.logger.Error("unsubscribing the client", "err", err)
+					}
+					cncl()
+					if err := client.Stop(); err != nil {
+						m.logger.Error("stopping client", "err", err)
+					}
+					m.clearSubscriptionCancel(node)
+					<-ticker.C
+					continue retryLoop
+				case <-healthErrCh:
+					if active {
+						m.subscriptionDeactivated()
+						active = false
+					}
+					healthCancel()
+					nodeCancel()
+					ctx, cncl := context.WithTimeout(context.Background(), time.Second)
+					if err := client.Unsubscribe(ctx, ComponentName, query); err != nil {
+						m.logger.Error("unsubscribing the client", "err", err)
+					}
+					cncl()
+					if err := client.Stop(); err != nil {
+						m.logger.Error("stopping client", "err", err)
+					}
+					m.clearSubscriptionCancel(node)
+					<-ticker.C
+					continue retryLoop
 				case msg, ok := <-eventCh:
 					m.logger.Debug("new event", msg)
 					if !ok {
 						m.logger.Error("event channel closed", "node", node)
+						if active {
+							m.subscriptionDeactivated()
+							active = false
+						}
+						healthCancel()
+						nodeCancel()
 						ctx, cncl := context.WithTimeout(context.Background(), time.Second)
-						defer cncl()
 						if err := client.Unsubscribe(ctx, ComponentName, query); err != nil {
 							m.logger.Error("unsubscribing the client", "err", err)
 						}
+						cncl()
 						if err := client.Stop(); err != nil {
 							m.logger.Error("stopping client", "err", err)
 						}
+						m.clearSubscriptionCancel(node)
 						<-ticker.C
 						continue retryLoop
 					}
@@ -206,7 +343,7 @@ retryLoop:
 								m.errCount.WithLabelValues("reportDecode").Inc()
 								continue
 							}
-							if err := m.storeReport(report); err == nil {
+							if err := m.storeReport(ctx, report); err == nil {
 								m.logger.Debug("stored report", "query", query, "vals", report)
 								continue
 							}
@@ -220,21 +357,29 @@ retryLoop:
 	}
 }
 
-func (m *BlockMonitor) shouldProcess(height int64) bool {
+func (m *Monitor) shouldProcess(height int64) bool {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 
-	if height <= m.lastHeight {
+	if _, seen := m.processedHeights[height]; seen {
 		return false
 	}
 
-	if m.lastHeight+1 != height {
-		m.errCount.WithLabelValues("missingBlock").Inc()
+	if height > m.lastHeight {
+		m.lastHeight = height
 	}
-	m.lastHeight = height
 
+	m.processedHeights[height] = struct{}{}
+	m.heightQueue = append(m.heightQueue, height)
+	if len(m.heightQueue) > processedHeightsLimit {
+		oldest := m.heightQueue[0]
+		m.heightQueue = m.heightQueue[1:]
+		delete(m.processedHeights, oldest)
+	}
 	return true
 }
+
+const processedHeightsLimit = 1000
 
 const (
 	reporterCol        = "reporter"
@@ -249,8 +394,8 @@ const (
 	metaIdCol          = "meta_id"
 )
 
-func (m *BlockMonitor) initDBTables() error {
-	ctx, cancel := context.WithTimeout(m.ctx, 5*time.Second)
+func (m *Monitor) initDBTables(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	// If TableName is "db.table", create DB first.
@@ -302,8 +447,8 @@ func (m *BlockMonitor) initDBTables() error {
 	return err
 }
 
-func (m *BlockMonitor) storeReport(r *types.MicroReport) error {
-	ctx, cancel := context.WithTimeout(m.ctx, 10*time.Millisecond)
+func (m *Monitor) storeReport(ctx context.Context, r *types.MicroReport) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
 	defer cancel()
 
 	var cycle uint8
@@ -406,7 +551,7 @@ func DecodeQueryID(val string) ([]byte, error) {
 }
 
 // DecodeReportEvent extracts a MicroReport from a CometBFT event payload.
-func DecodeReportEvent(height int64, ev abci.Event) (*types.MicroReport, error) {
+func DecodeReportEvent(height int64, ev abci.Event) (types.MicroReport, error) {
 	var report types.MicroReport
 
 	for _, attr := range ev.Attributes {
