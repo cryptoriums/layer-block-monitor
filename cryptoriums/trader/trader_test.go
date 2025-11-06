@@ -2,7 +2,11 @@ package trader
 
 import (
 	"context"
+	"fmt"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
@@ -22,16 +26,12 @@ const (
 func TestHandleRewardIsNonBlocking(t *testing.T) {
 	reporter := sdk.AccAddress([]byte("reporter-address-0001"))
 
+	cfg := newTestConfig(t, reporter)
 	tr, err := New(
 		context.Background(),
 		log.NewNopLogger(),
 		prometheus.NewRegistry(),
-		Config{
-			Reporter:   reporter,
-			ApiKey:     testApiKey,
-			SecretKey:  testSecretKey,
-			UseTestnet: true,
-		},
+		cfg,
 	)
 	require.NoError(t, err)
 
@@ -47,7 +47,6 @@ func TestHandleRewardIsNonBlocking(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			start := time.Now()
 			tr.HandleReward(tc.reporter, tc.amount)
@@ -68,16 +67,12 @@ func TestTraderFlushesOnShutdown(t *testing.T) {
 
 	reporter := sdk.AccAddress([]byte("reporter-address-0001"))
 
+	cfg := newTestConfig(t, reporter)
 	tr, err := New(
 		ctx,
 		cryptolog.New(),
 		prometheus.NewRegistry(),
-		Config{
-			Reporter:   reporter,
-			ApiKey:     testApiKey,
-			SecretKey:  testSecretKey,
-			UseTestnet: true,
-		},
+		cfg,
 	)
 	require.NoError(t, err)
 
@@ -97,4 +92,107 @@ func TestTraderFlushesOnShutdown(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return testutil.ToFloat64(tr.btcConverted.WithLabelValues(tr.reporter.String())) > 0
 	}, 10*time.Second, 10*time.Millisecond, "btcConverted metric did not increase after shutdown flush")
+}
+
+func newTestConfig(t *testing.T, reporter sdk.AccAddress) Config {
+	t.Helper()
+
+	cfg := Config{
+		Reporter:  reporter,
+		ApiKey:    testApiKey,
+		SecretKey: testSecretKey,
+	}
+
+	if isGitHubActions() {
+		server := newMockBinanceServer(t)
+		cfg.BinanceAPIURL = server.URL
+		t.Log("GITHUB actions - started a mock binance server")
+	} else {
+		cfg.BinanceAPIURL = "https://testnet.binance.vision"
+	}
+
+	return cfg
+}
+
+func isGitHubActions() bool {
+	return os.Getenv("GITHUB_ACTIONS") == "true"
+}
+
+func newMockBinanceServer(t *testing.T) *httptest.Server {
+	t.Helper()
+
+	handler := http.NewServeMux()
+
+	handler.HandleFunc("/api/v3/account", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+			"makerCommission":0,
+			"takerCommission":0,
+			"buyerCommission":0,
+			"sellerCommission":0,
+			"canTrade":true,
+			"canWithdraw":true,
+			"canDeposit":true,
+			"updateTime":0,
+			"accountType":"SPOT",
+			"balances":[
+				{"asset":"TRB","free":"100.0","locked":"0"},
+				{"asset":"USDC","free":"1000.0","locked":"0"},
+				{"asset":"BTC","free":"0.01","locked":"0"}
+			],
+			"permissions":["SPOT"]
+		}`)
+	})
+
+	handler.HandleFunc("/api/v3/ticker/price", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `[{"symbol":"BTCUSDC","price":"50000"}]`)
+	})
+
+	handler.HandleFunc("/api/v3/order", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("failed to parse form: %v", err)
+		}
+		switch r.Form.Get("symbol") {
+		case "TRBUSDC":
+			fmt.Fprint(w, `{
+				"symbol":"TRBUSDC",
+				"orderId":1,
+				"clientOrderId":"test-sell",
+				"transactTime":1700000000000,
+				"price":"0",
+				"origQty":"0.50",
+				"executedQty":"0.50",
+				"cummulativeQuoteQty":"25",
+				"status":"FILLED",
+				"timeInForce":"GTC",
+				"type":"MARKET",
+				"side":"SELL",
+				"fills":[]
+			}`)
+		case "BTCUSDC":
+			fmt.Fprint(w, `{
+				"symbol":"BTCUSDC",
+				"orderId":2,
+				"clientOrderId":"test-buy",
+				"transactTime":1700000000100,
+				"price":"0",
+				"origQty":"0.0019",
+				"executedQty":"0.0019",
+				"cummulativeQuoteQty":"90",
+				"status":"FILLED",
+				"timeInForce":"GTC",
+				"type":"MARKET",
+				"side":"BUY",
+				"fills":[]
+			}`)
+		default:
+			http.Error(w, "unsupported symbol", http.StatusBadRequest)
+		}
+	})
+
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	return server
 }

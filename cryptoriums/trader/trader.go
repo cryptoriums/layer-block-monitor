@@ -26,10 +26,10 @@ const (
 
 // Config controls reporter access and execution behavior.
 type Config struct {
-	Reporter   sdk.AccAddress `json:"reporter" yaml:"reporter"`
-	ApiKey     string
-	SecretKey  string
-	UseTestnet bool
+	Reporter      sdk.AccAddress `json:"reporter" yaml:"reporter"`
+	ApiKey        string
+	SecretKey     string
+	BinanceAPIURL string
 }
 
 // Trader executes trades and tracks balances for the configured reporter.
@@ -62,11 +62,10 @@ func New(
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
-	if cfg.UseTestnet {
-		binance.UseTestnet = true
-	}
-
 	bclient := binance.NewClient(cfg.ApiKey, cfg.SecretKey)
+	if cfg.BinanceAPIURL != "" {
+		bclient.BaseURL = cfg.BinanceAPIURL
+	}
 	_, err := bclient.NewGetAccountService().Do(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("binance client initialization:%w", err)
