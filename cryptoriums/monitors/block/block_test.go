@@ -10,7 +10,6 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -23,6 +22,7 @@ import (
 
 	ctypes "github.com/cometbft/cometbft/types"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
 	cryptolog "github.com/tellor-io/layer/cryptoriums/log"
@@ -96,7 +96,7 @@ func TestDeduplication(t *testing.T) {
 			schedules := make([]map[int]struct{}, len(tc.nodes))
 
 			for i, stream := range tc.nodes {
-				app := newTestApp(blocks[0].Height)
+				app := newTestApp(t, blocks[0].Height)
 				apps[i] = app
 
 				cfg := rpctest.GetConfig(true)
@@ -128,6 +128,7 @@ func TestDeduplication(t *testing.T) {
 				monitorCfg,
 				prometheus.NewRegistry(),
 				SQLDB{DB: sqlDB},
+				nil,
 			)
 			require.NoError(t, err)
 
@@ -137,7 +138,7 @@ func TestDeduplication(t *testing.T) {
 			for blockIdx, blk := range blocks {
 				for idx, app := range apps {
 					require.Eventually(t, func() bool {
-						return app.CurrentHeight() == blk.Height
+						return app.CurrentHeight() >= blk.Height
 					}, 5*time.Second, 25*time.Millisecond, "node %d did not reach height %d", idx, blk.Height)
 
 					if _, ok := schedules[idx][blockIdx]; ok {
@@ -163,154 +164,210 @@ func TestDeduplication(t *testing.T) {
 	}
 }
 
-func TestMonitorRecoversFromNodeFailures(t *testing.T) {
-	ctx := context.Background()
-
-	db := newMockDB()
-	monitorCfg := Config{}
-
-	monitor, err := New(
-		cryptolog.New(),
-		monitorCfg,
-		prometheus.NewRegistry(),
-		db,
-	)
-	require.NoError(t, err)
-
-	require.Zero(t, monitor.ActiveSubscriptions(), "no subscriptions should be active at start")
-
-	sendBatch := func(ids []int) {
-		for _, id := range ids {
-			report := makeSyntheticReport(t, id)
-			require.NoError(t, monitor.storeReport(ctx, &report))
-		}
+func TestNodeFailure(t *testing.T) {
+	cases := []struct {
+		name      string
+		nodeCount int
+		plan      func(active *activeNodes, blockIdx int)
+	}{
+		{
+			name:      "single node fails and recovers",
+			nodeCount: 1,
+			plan: func(active *activeNodes, blockIdx int) {
+				if blockIdx == 1 {
+					active.Stop(0)
+					active.Start(0)
+				}
+			},
+		},
+		{
+			name:      "two nodes fail together and recover",
+			nodeCount: 2,
+			plan: func(active *activeNodes, blockIdx int) {
+				if blockIdx == 1 {
+					active.Stop(0, 1)
+					active.Start(0, 1)
+				}
+			},
+		},
+		{
+			name:      "node2 fails, recovers, then node1 fails",
+			nodeCount: 2,
+			plan: func(active *activeNodes, blockIdx int) {
+				switch blockIdx {
+				case 0:
+					active.Stop(1)
+				case 2:
+					active.StartIfStopped(1)
+					active.Stop(0)
+				}
+			},
+		},
 	}
 
-	assertValues := func(expected []int) {
-		reports := db.snapshot()
-		require.Len(t, reports, len(expected))
-		got := make(map[string]struct{}, len(reports))
-		for _, r := range reports {
-			got[r.Value] = struct{}{}
-		}
-		for _, id := range expected {
-			val := fmt.Sprintf("value-%d", id)
-			if _, ok := got[val]; !ok {
-				t.Fatalf("missing report value %s in %v", val, got)
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			blocks := makeSyntheticBlocks(t, 1, 2, 3, 4, 5)
+			reports := blocksToReports(t, blocks)
+
+			sqlDB, err := sql.Open("chdb", "")
+			require.NoError(t, err)
+			defer func() { _ = sqlDB.Close() }()
+
+			monitorCfg := Config{InitDB: true}
+			h := newNodeHarness(t, tc.nodeCount, blocks[0].Height)
+			apps, nodes := h.apps, h.nodes
+
+			for _, addr := range h.addresses {
+				monitorCfg.Nodes = append(monitorCfg.Nodes, addr)
 			}
-		}
+
+			monitor, err := New(
+				cryptolog.New(),
+				monitorCfg,
+				prometheus.NewRegistry(),
+				SQLDB{DB: sqlDB},
+				nil,
+			)
+			require.NoError(t, err)
+
+			go monitor.Start(ctx)
+
+			active := newActiveNodes(t, nodes, monitor)
+			active.Wait(float64(tc.nodeCount))
+
+			for idx, blk := range blocks {
+				tc.plan(active, idx)
+				for nodeIdx := range apps {
+					if !active.IsRunning(nodeIdx) {
+						continue
+					}
+					apps[nodeIdx].PushEvents(flattenExecResults(blk.TxsResults))
+				}
+			}
+
+			var reportsAct []types.MicroReport
+			require.Eventually(t, func() bool {
+				reportsAct = fetchReportsFromDB(t, sqlDB)
+				return len(reportsAct) == len(reports)
+			}, 10*time.Second, 200*time.Millisecond, "missing expected report count mismatch exp:%v, act:%v", len(reports), len(reportsAct))
+
+			require.Equal(t,
+				sortReports(t, copyReports(reports)),
+				sortReports(t, copyReports(reportsAct)),
+			)
+		})
 	}
-
-	monitor.subscriptionActivated()
-	require.Equal(t, 1, monitor.ActiveSubscriptions(), "subscription count should increase after activation")
-
-	sendBatch([]int{1, 2, 3})
-	assertValues([]int{1, 2, 3})
-
-	monitor.subscriptionDeactivated()
-	require.Zero(t, monitor.ActiveSubscriptions(), "subscription count should drop after deactivation")
-
-	monitor.subscriptionActivated()
-	require.Equal(t, 1, monitor.ActiveSubscriptions(), "subscription count should increase after reactivation")
-
-	sendBatch([]int{4, 5})
-	assertValues([]int{1, 2, 3, 4, 5})
 }
 
-// Test deduplication with few separate nodes (independent blockchains)
-// Each node emits the same blocks
-// Deduplication ensures each height is processed only once (first node to emit wins)
-// Even though the nodes emit the same events multiple times, deduplication processes each height only once
-// func TestDeduplication(t *testing.T) {
+type nodeHarness struct {
+	apps      []*testApp
+	nodes     []*nm.Node
+	addresses []string
+}
 
-// 	ctx, cncl := context.WithCancel(context.Background())
-// 	t.Cleanup(cncl)
+func newNodeHarness(t *testing.T, count int, initialHeight int64) *nodeHarness {
+	h := &nodeHarness{
+		apps:      make([]*testApp, count),
+		nodes:     make([]*nm.Node, count),
+		addresses: make([]string, 0, count),
+	}
+	for i := 0; i < count; i++ {
+		app := newTestApp(t, initialHeight)
+		h.apps[i] = app
 
-// 	sqlDB, err := sql.Open("chdb", "")
-// 	require.NoError(t, err)
-// 	t.Cleanup(func() {
-// 		if err = sqlDB.Close(); err != nil {
-// 			t.Log("closing the db", "err", err)
-// 		}
-// 	})
+		cfg := rpctest.GetConfig(true)
+		genDoc, err := ctypes.GenesisDocFromFile(cfg.GenesisFile())
+		require.NoError(t, err)
+		genDoc.InitialHeight = initialHeight
+		require.NoError(t, genDoc.SaveAs(cfg.GenesisFile()))
 
-// 	blocks := loadFixtureTxs(t)
-// 	require.NotEmpty(t, blocks)
+		node := rpctest.StartTendermint(app)
+		h.nodes[i] = node
+		h.addresses = append(h.addresses, node.Config().RPC.ListenAddress)
 
-// 	expectedReports := extractExpectedReports(t, blocks)
-// 	require.NotEmpty(t, expectedReports)
-// 	expectedReportCount := 20
-// 	require.Len(t, expectedReports, expectedReportCount, "fixtures should contain 20 total reports")
+		appRef := app
+		nodeRef := node
+		t.Cleanup(func() {
+			appRef.Close()
+			rpctest.StopTendermint(nodeRef)
+		})
+	}
+	return h
+}
 
-// 	// Create monitor configuration
-// 	monitorCfg := Config{
-// 		InitDB: true,
-// 	}
+type activeNodes struct {
+	t       *testing.T
+	nodes   []*nm.Node
+	monitor *Monitor
+	running map[int]bool
+}
 
-// 	// Create 3 separate nodes for redundancy testing
-// 	// Each node is an independent CometBFT instance with its own test app
-// 	// Following the client's requirement: 3 different nodes with different RPC addresses
-// 	var apps []*testApp
-// 	for i := 0; i < 3; i++ {
-// 		cfg := rpctest.GetConfig(true) // force a fresh config/root dir
-// 		genDoc, err := ctypes.GenesisDocFromFile(cfg.GenesisFile())
-// 		require.NoError(t, err)
+func newActiveNodes(t *testing.T, nodes []*nm.Node, monitor *Monitor) *activeNodes {
+	a := &activeNodes{
+		t:       t,
+		nodes:   nodes,
+		monitor: monitor,
+		running: make(map[int]bool, len(nodes)),
+	}
+	for i := range nodes {
+		a.running[i] = true
+	}
+	return a
+}
 
-// 		genDoc.InitialHeight = blocks[0].Height
-// 		err = genDoc.SaveAs(cfg.GenesisFile())
-// 		require.NoError(t, err)
+func (a *activeNodes) IsRunning(idx int) bool {
+	return a.running[idx]
+}
 
-// 		app := newTestApp()
-// 		apps = append(apps, app)
+func (a *activeNodes) Wait(expected float64) {
+	require.Eventually(a.t, func() bool {
+		return testutil.ToFloat64(a.monitor.subsActive) == expected
+	}, 5*time.Second, 25*time.Millisecond, "expected %v active subscriptions", expected)
+}
 
-// 		n := rpctest.StartTendermint(app)
-// 		t.Cleanup(func() {
-// 			// Run this before closing the chain.
-// 			// Stopping the chain blocks unless we release the finilize block function.
-// 			app.Close()
-// 			rpctest.StopTendermint(n)
-// 		})
+func (a *activeNodes) Stop(idxs ...int) {
+	for _, idx := range idxs {
+		if !a.running[idx] {
+			continue
+		}
+		require.NoError(a.t, a.nodes[idx].Stop())
+		a.running[idx] = false
+	}
+	a.Wait(a.count())
+}
 
-// 		monitorCfg.Nodes = append(monitorCfg.Nodes, n.Config().RPC.ListenAddress)
-// 		t.Logf("Started node %d with RPC address: %s", i, n.Config().RPC.ListenAddress)
-// 	}
+func (a *activeNodes) Start(idxs ...int) {
+	for _, idx := range idxs {
+		if a.running[idx] {
+			continue
+		}
+		require.NoError(a.t, a.nodes[idx].Start())
+		a.running[idx] = true
+	}
+	a.Wait(a.count())
+}
 
-// 	monitor, err := New(
-// 		cryptolog.New(),
-// 		monitorCfg,
-// 		prometheus.NewRegistry(),
-// 		SQLDB{DB: sqlDB},
-// 	)
-// 	require.NoError(t, err)
-// 	go monitor.Start(ctx)
+func (a *activeNodes) StartIfStopped(idx int) {
+	if a.running[idx] {
+		return
+	}
+	a.Start(idx)
+}
 
-// 	monitor.IsReady()
-
-// 	for _, block := range blocks {
-// 		for _, app := range apps {
-// 			app.PushEvents(flattenExecResults(block.TxsResults))
-// 		}
-// 	}
-
-// 	// Wait for monitor to process all events from all 3 nodes
-// 	// With multiple nodes, deduplication should ensure each block is processed only once
-// 	var actualReportsCount int
-// 	require.Eventually(t, func() bool {
-// 		actualReports := fetchReportsFromDB(t, sqlDB)
-// 		actualReportsCount = len(actualReports)
-// 		return actualReportsCount == expectedReportCount
-// 	}, 5*time.Second, 500*time.Millisecond, "should receive exactly %d reports, but received:%v", expectedReportCount, actualReportsCount)
-
-// 	// Verify final report count
-// 	actualReports := fetchReportsFromDB(t, sqlDB)
-// 	t.Logf("Received %d total reports (expected %d)", len(actualReports), expectedReportCount)
-// 	require.Equal(t, expectedReportCount, len(actualReports), "should have exactly %v reports in the db", len(actualReports))
-
-// 	// Verify reports match expected fixture data
-// 	actualReports = sortReports(t, actualReports)
-// 	expectedReports = sortReports(t, expectedReports)
-// 	require.Equal(t, expectedReports, actualReports, "db reports should match expected fixture reports")
-// }
+func (a *activeNodes) count() float64 {
+	var count float64
+	for _, ok := range a.running {
+		if ok {
+			count++
+		}
+	}
+	return count
+}
 
 type blockFixture struct {
 	Height              string              `json:"height"`
@@ -412,19 +469,6 @@ func fetchReportsFromDB(t *testing.T, db *sql.DB) []types.MicroReport {
 	return reports
 }
 
-type comparableReport struct {
-	Reporter        string
-	Power           uint64
-	QueryType       string
-	QueryIDHex      string
-	AggregateMethod string
-	Value           string
-	Timestamp       time.Time
-	Cyclelist       bool
-	BlockNumber     uint64
-	MetaID          uint64
-}
-
 func sortReports(t *testing.T, reports []types.MicroReport) []types.MicroReport {
 	t.Helper()
 
@@ -451,17 +495,19 @@ func fixturePath(t *testing.T, name string) string {
 
 type testApp struct {
 	kvstore.Application
+	t *testing.T
 
 	mu            sync.Mutex
 	currentHeight int64
 	events        chan []abci.Event
 }
 
-func newTestApp(currentHeight int64) *testApp {
+func newTestApp(t *testing.T, currentHeight int64) *testApp {
 	return &testApp{
 		Application:   *kvstore.NewInMemoryApplication(),
 		events:        make(chan []abci.Event, 1000),
 		currentHeight: currentHeight,
+		t:             t,
 	}
 }
 
@@ -488,14 +534,14 @@ func (app *testApp) FinalizeBlock(ctx context.Context, req *abci.RequestFinalize
 	app.currentHeight = int64(req.Height)
 	app.mu.Unlock()
 
-	fmt.Println("new block", req.Height)
+	app.t.Log("new block", req.Height)
 
 	select {
 	case events := <-app.events:
 		resp.Events = append(resp.Events, events...)
 	}
 
-	fmt.Println("new block done", req.Height)
+	app.t.Log("new block done", req.Height)
 
 	return resp, nil
 }
@@ -562,29 +608,6 @@ func copyReports(reports []types.MicroReport) []types.MicroReport {
 	return out
 }
 
-func waitForReportValues(t *testing.T, db *sql.DB, ids []int) {
-	t.Helper()
-
-	expected := make([]string, len(ids))
-	for i, id := range ids {
-		expected[i] = fmt.Sprintf("value-%d", id)
-	}
-
-	require.Eventually(t, func() bool {
-		reports := fetchReportsFromDB(t, db)
-		seen := make(map[string]struct{}, len(reports))
-		for _, r := range reports {
-			seen[r.Value] = struct{}{}
-		}
-		for _, v := range expected {
-			if _, ok := seen[v]; !ok {
-				return false
-			}
-		}
-		return true
-	}, 10*time.Second, 200*time.Millisecond, "missing expected report values %v", expected)
-}
-
 func makeSyntheticReport(t *testing.T, id int) types.MicroReport {
 	t.Helper()
 
@@ -604,6 +627,41 @@ func makeSyntheticReport(t *testing.T, id int) types.MicroReport {
 		BlockNumber:     uint64(id),
 		MetaId:          uint64(1000 + id),
 	}
+}
+
+func makeSyntheticBlocks(t *testing.T, ids ...int) []block {
+	t.Helper()
+
+	blocks := make([]block, len(ids))
+	for i, id := range ids {
+		report := makeSyntheticReport(t, id)
+		blocks[i] = block{
+			Height: int64(report.BlockNumber),
+			TxsResults: []abci.ExecTxResult{
+				{Events: []abci.Event{reportToEvent(t, report)}},
+			},
+		}
+	}
+	return blocks
+}
+
+func blocksToReports(t *testing.T, blocks []block) []types.MicroReport {
+	t.Helper()
+
+	var reports []types.MicroReport
+	for _, blk := range blocks {
+		for _, tx := range blk.TxsResults {
+			for _, ev := range tx.Events {
+				if ev.Type != "new_report" {
+					continue
+				}
+				report, err := DecodeReportEvent(blk.Height, ev)
+				require.NoError(t, err)
+				reports = append(reports, *report)
+			}
+		}
+	}
+	return reports
 }
 
 func reportToEvent(t *testing.T, report types.MicroReport) abci.Event {
@@ -626,69 +684,3 @@ func reportToEvent(t *testing.T, report types.MicroReport) abci.Event {
 
 	return abci.Event{Type: "new_report", Attributes: attrs}
 }
-
-type mockDB struct {
-	mu      sync.Mutex
-	reports []types.MicroReport
-}
-
-func newMockDB() *mockDB {
-	return &mockDB{}
-}
-
-func (m *mockDB) Exec(_ context.Context, query string, args ...any) (sql.Result, error) {
-	q := strings.TrimSpace(strings.ToUpper(query))
-	if strings.HasPrefix(q, "INSERT INTO") {
-		if len(args) != 10 {
-			return nil, fmt.Errorf("unexpected arg count: %d", len(args))
-		}
-		report := types.MicroReport{
-			Reporter:        args[0].(string),
-			Power:           args[1].(uint64),
-			QueryType:       args[2].(string),
-			AggregateMethod: args[4].(string),
-			Value:           args[5].(string),
-			Timestamp:       args[6].(time.Time),
-			Cyclelist:       args[7].(uint8) == 1,
-			BlockNumber:     args[8].(uint64),
-			MetaId:          args[9].(uint64),
-		}
-		queryIDHex := args[3].(string)
-		queryID, err := DecodeQueryID(queryIDHex)
-		if err != nil {
-			return nil, err
-		}
-		report.QueryId = append([]byte(nil), queryID...)
-		m.mu.Lock()
-		m.reports = append(m.reports, report)
-		m.mu.Unlock()
-		return mockResult{}, nil
-	}
-	return mockResult{}, nil
-}
-
-func (m *mockDB) Query(context.Context, string, ...any) (*sql.Rows, error) {
-	return nil, fmt.Errorf("not implemented")
-}
-
-func (m *mockDB) Prepare(context.Context, string) (*sql.Stmt, error) {
-	return nil, fmt.Errorf("not implemented")
-}
-
-func (m *mockDB) snapshot() []types.MicroReport {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	out := make([]types.MicroReport, len(m.reports))
-	for i, r := range m.reports {
-		out[i] = r
-		if len(r.QueryId) > 0 {
-			out[i].QueryId = append([]byte(nil), r.QueryId...)
-		}
-	}
-	return out
-}
-
-type mockResult struct{}
-
-func (mockResult) LastInsertId() (int64, error) { return 0, nil }
-func (mockResult) RowsAffected() (int64, error) { return 1, nil }
