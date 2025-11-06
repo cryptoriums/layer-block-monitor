@@ -202,32 +202,6 @@ retryLoop:
 					for _, ev := range blockEv.Events {
 						switch ev.Type {
 						case "new_dispute":
-							m.mtx.Lock()
-							cfg := m.cfg
-							m.mtx.Unlock()
-
-							var disputeID uint64
-							for _, attr := range ev.Attributes {
-								attrVal := string(attr.Value)
-
-								if attr.Key == "dispute_id" {
-									disputeID, err = ParseDisputeID(attrVal)
-									if err != nil {
-										panic("parsing dispute ID")
-									}
-								}
-							}
-
-							var noPanic bool
-							for _, ignoreID := range cfg.IgnoreDisputes {
-								if ignoreID == disputeID {
-									noPanic = true
-									break
-								}
-							}
-							if !noPanic {
-								panic(ReasonOpenDisputes)
-							}
 
 						case "new_report":
 							report, err := DecodeReportEvent(uint64(blockEv.Height), ev)

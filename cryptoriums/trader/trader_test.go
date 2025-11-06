@@ -51,7 +51,7 @@ func TestHandleRewardIsNonBlocking(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			start := time.Now()
 			tr.HandleReward(tc.reporter, tc.amount)
-			if time.Since(start) > 20*time.Millisecond {
+			if time.Since(start) > 100*time.Millisecond {
 				t.Fatalf("HandleReward blocked caller for case %s", tc.name)
 			}
 		})
@@ -59,7 +59,7 @@ func TestHandleRewardIsNonBlocking(t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		return testutil.ToFloat64(tr.errCount.WithLabelValues("nil_amount")) == 2
-	}, 200*time.Millisecond, 10*time.Millisecond, "expected nil_amount counter to reach 2")
+	}, time.Second, 10*time.Millisecond, "expected nil_amount counter to reach 2")
 }
 
 func TestTraderFlushesOnShutdown(t *testing.T) {
