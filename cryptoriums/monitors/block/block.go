@@ -386,11 +386,6 @@ func (m *Monitor) storeReport(ctx context.Context, r *types.MicroReport) error {
 	return nil
 }
 
-// ParseDisputeID converts decimal strings to uint64.
-func ParseDisputeID(val string) (uint64, error) {
-	return strconv.ParseUint(val, 10, 64)
-}
-
 // ParseTimestamp parses timestamps stored on chain into UTC time.
 func ParseTimestamp(val string) (time.Time, error) {
 	if ts, err := time.Parse(time.RFC3339Nano, val); err == nil {

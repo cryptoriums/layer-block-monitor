@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
 	"cosmossdk.io/log"
+	ctypes "github.com/cometbft/cometbft/abci/types"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/tellor-io/layer/x/dispute/types"
 	"gopkg.in/yaml.v2"
@@ -18,17 +20,21 @@ const (
 	Component           = "dispute_monitor"
 	ReasonOpenDisputes  = "there are open disputes so not safe to continue reporting, if the open disputes are safe to ignore add their IDs in the config"
 	ReasonTooManyErrors = "too many consecutive errors querying dispute endpoints"
+	ErrorThreshold      = 20
 )
 
 type Config struct {
 	Nodes          []string `yaml:"nodes"`
-	ErrorThreshold int      `yaml:"errorThreshold"`
+	IgnoreDisputes []uint64
 }
 
 type Monitor struct {
-	cfg          Config
-	errorCounter *prometheus.CounterVec
-	logger       log.Logger
+	cfg                 Config
+	errorCounter        *prometheus.CounterVec
+	openDisputesCount   prometheus.Gauge
+	disputesEventsCount prometheus.Counter
+	logger              log.Logger
+	mtx                 sync.Mutex
 }
 
 func New(logger log.Logger, cfg Config) *Monitor {
@@ -39,20 +45,31 @@ func New(logger log.Logger, cfg Config) *Monitor {
 		},
 		[]string{"node"},
 	)
-	if cfg.ErrorThreshold == 0 {
-		cfg.ErrorThreshold = 20
-	}
+	openDisputesCount := prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "dispute_open_disputes_count",
+			Help: "Number of open disputes reported by the last successful query",
+		},
+	)
+	disputesEventsCount := prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "dispute_events_total",
+			Help: "Total dispute events processed by the monitor",
+		},
+	)
+
 	return &Monitor{
-		cfg:          cfg,
-		errorCounter: errorCounter,
-		logger:       logger.With("component", Component),
+		cfg:                 cfg,
+		errorCounter:        errorCounter,
+		openDisputesCount:   openDisputesCount,
+		disputesEventsCount: disputesEventsCount,
+		logger:              logger.With("component", Component),
 	}
 }
 
 func (m *Monitor) ReloadCfg(cfg Config) {
-	if cfg.ErrorThreshold == 0 {
-		cfg.ErrorThreshold = 20
-	}
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
 	m.cfg = cfg
 }
 
@@ -90,30 +107,30 @@ func (m *Monitor) Start(ctx context.Context, interval time.Duration) {
 						resultsCh <- disputeResult{node: node, openIDs: nil, err: fmt.Errorf("no open disputes")}
 						return
 					}
-					m.logger.Warn("there are open disputes", "node", node, "ids", result.OpenDisputes.Ids)
 					resultsCh <- disputeResult{node: node, openIDs: result.OpenDisputes.Ids, err: nil}
 				}(node)
 			}
 			wg.Wait()
 			close(resultsCh)
 
-			shouldPanic := false
 			errorCount := 0
 			for res := range resultsCh {
+				m.openDisputesCount.Set(float64(len(res.openIDs)))
 				if res.err != nil {
 					errorCount++
+					continue
 				}
 				if len(res.openIDs) > 0 {
-					shouldPanic = true
 					m.logger.Warn("open dispute detected", "node", res.node, "ids", res.openIDs)
 				}
+				for _, disputeID := range res.openIDs {
+					m.panicWhenNotIgnored(disputeID)
+				}
 			}
-			if shouldPanic {
-				panic(ReasonOpenDisputes)
-			}
+
 			if errorCount == len(cfg.Nodes) {
 				consecutiveErrors++
-				if consecutiveErrors > cfg.ErrorThreshold {
+				if consecutiveErrors > ErrorThreshold {
 					m.logger.Error("Too many consecutive errors, panicking")
 					panic(ReasonTooManyErrors)
 				}
@@ -121,6 +138,39 @@ func (m *Monitor) Start(ctx context.Context, interval time.Duration) {
 			}
 			consecutiveErrors = 0
 		}
+	}
+}
+
+func (m *Monitor) HandleDisputeEvent(ev ctypes.Event) {
+	m.disputesEventsCount.Inc()
+
+	for _, attr := range ev.Attributes {
+		attrVal := attr.Value
+		if attr.Key == "dispute_id" {
+			disputeID, err := ParseDisputeID(attrVal)
+			if err != nil {
+				panic("parsing dispute ID")
+			}
+
+			m.panicWhenNotIgnored(disputeID)
+
+		}
+	}
+}
+
+func (m *Monitor) panicWhenNotIgnored(disputeID uint64) {
+	m.mtx.Lock()
+	cfg := m.cfg
+	m.mtx.Unlock()
+	var noPanic bool
+	for _, ignoreID := range cfg.IgnoreDisputes {
+		if ignoreID == disputeID {
+			noPanic = true
+			break
+		}
+	}
+	if !noPanic {
+		panic(ReasonOpenDisputes)
 	}
 }
 
@@ -154,4 +204,9 @@ func (m *Monitor) queryDisputes(node string, interval time.Duration) (*types.Que
 		return nil, err
 	}
 	return &result, nil
+}
+
+// ParseDisputeID converts decimal strings to uint64.
+func ParseDisputeID(val string) (uint64, error) {
+	return strconv.ParseUint(val, 10, 64)
 }
