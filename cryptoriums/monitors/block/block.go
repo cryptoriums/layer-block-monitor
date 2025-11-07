@@ -58,13 +58,14 @@ type Config struct {
 }
 
 type Monitor struct {
-	cfg         Config
-	logger      log.Logger
-	db          Db
-	errCount    *prometheus.CounterVec
-	reportCount prometheus.Counter
-	subsActive  prometheus.Gauge
-	mtx         sync.Mutex
+	cfg          Config
+	logger       log.Logger
+	db           Db
+	errCount     *prometheus.CounterVec
+	reportCount  prometheus.Counter
+	reportsCount *prometheus.CounterVec
+	subsActive   prometheus.Gauge
+	mtx          sync.Mutex
 
 	processedHeights map[int64]struct{}
 	heightQueue      []int64
@@ -88,6 +89,12 @@ func New(logger log.Logger, cfg Config, reg prometheus.Registerer, db Db, dh Dis
 		Name:      MetricReportCount,
 		Help:      "Reports inserted into ClickHouse",
 	})
+	reportsCount := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+		Namespace: cryptoriums.MetricsNamespace,
+		Subsystem: ComponentName,
+		Name:      "reports_count",
+		Help:      "Reports observed per reporter",
+	}, []string{"reporter"})
 	subsActive := promauto.With(reg).NewGauge(prometheus.GaugeOpts{
 		Namespace: cryptoriums.MetricsNamespace,
 		Subsystem: ComponentName,
@@ -100,6 +107,7 @@ func New(logger log.Logger, cfg Config, reg prometheus.Registerer, db Db, dh Dis
 		db:                  db,
 		errCount:            errCount,
 		reportCount:         reportCount,
+		reportsCount:        reportsCount,
 		subsActive:          subsActive,
 		processedHeights:    make(map[int64]struct{}),
 		readyCh:             make(chan struct{}, len(cfg.Nodes)),
@@ -250,9 +258,8 @@ func (m *Monitor) runSubscription(
 				m.errCount.WithLabelValues("wrongEventType").Inc()
 				continue
 			}
-			height := blockEv.Height
 
-			if !m.shouldProcess(height) {
+			if !m.shouldProcess(blockEv.Height) {
 				continue
 			}
 
@@ -271,6 +278,7 @@ func (m *Monitor) handleNewBlock(ctx context.Context, logger log.Logger, blockEv
 				m.errCount.WithLabelValues("reportDecode").Inc()
 				continue
 			}
+			m.reportsCount.WithLabelValues(report.Reporter).Inc()
 			if err := m.storeReport(ctx, *report); err == nil {
 				logger.Debug("stored report", "query", query, "vals", report)
 				continue
