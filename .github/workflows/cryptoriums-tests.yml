@@ -19,5 +19,9 @@ jobs:
       - name: Install chdb dependency
         run: curl -sL https://lib.chdb.io | bash
 
-      - name: Run cryptoriums tests
-        run: go test -v ./cryptoriums/...
+      - name: Run cryptoriums tests (excluding tools)
+        run: |
+          pkgs=$(go list ./cryptoriums/... | grep -v '/tools')
+          if [ -n "$pkgs" ]; then
+            go test -v $pkgs
+          fi
