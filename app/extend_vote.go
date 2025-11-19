@@ -15,6 +15,7 @@ import (
 	abci "github.com/cometbft/cometbft/abci/types"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/spf13/viper"
+	"github.com/tellor-io/layer/cryptoriums/wallet"
 	bridgetypes "github.com/tellor-io/layer/x/bridge/types"
 	oracletypes "github.com/tellor-io/layer/x/oracle/types"
 
@@ -401,7 +402,11 @@ func (h *VoteExtHandler) InitKeyring() (keyring.Keyring, error) {
 	if krDir == "" {
 		return nil, fmt.Errorf("keyring directory not set, please use --home or --keyring-dir flag")
 	}
-	kr, err := keyring.New(sdk.KeyringServiceName(), krBackend, krDir, os.Stdin, h.codec)
+	reader, err := wallet.Reader(StartCtx, h.logger, h.codec)
+	if err != nil {
+		return nil, err
+	}
+	kr, err := keyring.New(sdk.KeyringServiceName(), krBackend, krDir, reader, h.codec)
 	if err != nil {
 		return nil, err
 	}

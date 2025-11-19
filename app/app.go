@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -149,6 +150,7 @@ const (
 var (
 	// DefaultNodeHome default home directories for the application daemon
 	DefaultNodeHome string
+	StartCtx        context.Context
 
 	// module account permissions
 	maccPerms = map[string][]string{
