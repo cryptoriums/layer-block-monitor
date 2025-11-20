@@ -1,0 +1,40 @@
+# Test Dockerfile with libchdb support (using Debian for glibc compatibility)
+ARG BUILDER_IMAGE=docker.io/golang:1.23.2
+
+FROM --platform=$BUILDPLATFORM ${BUILDER_IMAGE} AS test-builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    git \
+    make \
+    curl \
+    bash \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install libchdb from GitHub releases (use latest)
+RUN mkdir -p /usr/local/lib && \
+    LATEST_RELEASE=$(curl --silent "https://api.github.com/repos/chdb-io/chdb/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/') && \
+    echo "Downloading chdb ${LATEST_RELEASE}" && \
+    curl -L -o /tmp/libchdb.tar.gz "https://github.com/chdb-io/chdb/releases/download/${LATEST_RELEASE}/linux-x86_64-libchdb.tar.gz" && \
+    tar -xzf /tmp/libchdb.tar.gz -C /usr/local/lib/ && \
+    chmod +x /usr/local/lib/libchdb.so && \
+    rm /tmp/libchdb.tar.gz && \
+    ldconfig
+
+WORKDIR /layer
+
+# Copy go mod files first for better caching
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy the rest of the source code
+COPY . .
+
+# Set environment for tests
+ENV CGO_ENABLED=0
+ENV GO111MODULE=on
+
+# Default command runs the block monitor tests
+CMD ["go", "test", "-v", "./cryptoriums/monitors/block/...", "-timeout", "10m"]

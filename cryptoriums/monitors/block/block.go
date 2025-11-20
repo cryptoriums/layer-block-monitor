@@ -3,9 +3,8 @@ package block
 import (
 	"context"
 	"database/sql"
-	"encoding/hex"
+	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,530 +13,326 @@ import (
 	abci "github.com/cometbft/cometbft/abci/types"
 	rpchttp "github.com/cometbft/cometbft/rpc/client/http"
 	coretypes "github.com/cometbft/cometbft/rpc/core/types"
-
 	ctypes "github.com/cometbft/cometbft/types"
-
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/tellor-io/layer/cryptoriums"
-	"github.com/tellor-io/layer/x/oracle/types"
+
+	"github.com/tellor-io/layer/cryptoriums/db"
+	"github.com/tellor-io/layer/cryptoriums/monitors/block/processor"
 )
 
-const (
-	ComponentName     = "block_monitor"
-	MetricErrCount    = "errors_total"
-	MetricReportCount = "reports_total"
-	TableName         = "reports"
-)
+const ComponentName = "block-monitor"
 
-type SQLDB struct{ *sql.DB }
-
-func (s SQLDB) Exec(ctx context.Context, q string, args ...any) (sql.Result, error) {
-	return s.DB.ExecContext(ctx, q, args...)
-}
-func (s SQLDB) Query(ctx context.Context, q string, args ...any) (*sql.Rows, error) {
-	return s.DB.QueryContext(ctx, q, args...)
-}
-func (s SQLDB) Prepare(ctx context.Context, q string) (*sql.Stmt, error) {
-	return s.DB.PrepareContext(ctx, q)
-}
-
-type Db interface {
-	Exec(context.Context, string, ...any) (sql.Result, error)
-	Query(context.Context, string, ...any) (*sql.Rows, error)
-	Prepare(context.Context, string) (*sql.Stmt, error)
-}
-
-type DisputeEventHandler interface {
-	HandleDisputeEvent(abci.Event)
-}
-
+// Config controls the RPC-based monitor behaviour.
 type Config struct {
-	Nodes  []string `yaml:"nodes"`
-	InitDB bool     `yaml:"initDB"`
+	Nodes        []string      `yaml:"nodes"`
+	Backfill     bool          `yaml:"backfill"`
+	PollInterval time.Duration `yaml:"poll_interval"`
 }
 
+// Monitor polls ABCI endpoints to ingest blocks without using websockets.
 type Monitor struct {
 	cfg          Config
 	logger       log.Logger
-	db           Db
-	errCount     *prometheus.CounterVec
-	reportCount  prometheus.Counter
-	reportsCount *prometheus.CounterVec
-	subsActive   prometheus.Gauge
-	mtx          sync.Mutex
+	clients      []*rpchttp.HTTP
+	db           db.Db
+	pollInterval time.Duration
+	processor    processor.BlockProcessor
 
-	processedHeights map[int64]struct{}
-	heightQueue      []int64
-
-	disputeEventHandler DisputeEventHandler
-
-	readyCh chan struct{}
+	// baselineHeight tracks the chain height when monitor started with Backfill=false
+	// Used to skip processing historical blocks
+	baselineHeight int64
+	baselineMu     sync.Mutex
 }
 
-func New(logger log.Logger, cfg Config, reg prometheus.Registerer, db Db, dh DisputeEventHandler) (*Monitor, error) {
-	errCount := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
-		Namespace: cryptoriums.MetricsNamespace,
-		Subsystem: ComponentName,
-		Name:      MetricErrCount,
-		Help:      "Errors in " + ComponentName,
-	}, []string{"error"},
+// New creates a new RPC monitor.
+func New(ctx context.Context, logger log.Logger, cfg Config, reg prometheus.Registerer, db db.Db) (*Monitor, error) {
+
+	if cfg.PollInterval <= 0 {
+		cfg.PollInterval = 800 * time.Millisecond
+	}
+
+	clients := make([]*rpchttp.HTTP, 0, len(cfg.Nodes))
+	for _, node := range cfg.Nodes {
+		client, err := rpchttp.New(node, "/websocket")
+		if err != nil {
+			return nil, err
+		}
+		clients = append(clients, client)
+	}
+	if len(clients) == 0 {
+		return nil, errors.New("no RPC nodes configured")
+	}
+
+	proc := processor.New(
+		logger,
+		db,
+		reg,
+		nil,
 	)
-	reportCount := promauto.With(reg).NewCounter(prometheus.CounterOpts{
-		Namespace: cryptoriums.MetricsNamespace,
-		Subsystem: ComponentName,
-		Name:      MetricReportCount,
-		Help:      "Reports inserted into ClickHouse",
-	})
-	reportsCount := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
-		Namespace: cryptoriums.MetricsNamespace,
-		Subsystem: ComponentName,
-		Name:      "reports_count",
-		Help:      "Reports observed per reporter",
-	}, []string{"reporter"})
-	subsActive := promauto.With(reg).NewGauge(prometheus.GaugeOpts{
-		Namespace: cryptoriums.MetricsNamespace,
-		Subsystem: ComponentName,
-		Name:      "subscriptions_active",
-		Help:      "Current number of active block subscriptions",
-	})
-	monitor := &Monitor{
-		cfg:                 cfg,
-		logger:              logger.With("component", ComponentName),
-		db:                  db,
-		errCount:            errCount,
-		reportCount:         reportCount,
-		reportsCount:        reportsCount,
-		subsActive:          subsActive,
-		processedHeights:    make(map[int64]struct{}),
-		readyCh:             make(chan struct{}, len(cfg.Nodes)),
-		disputeEventHandler: dh,
-	}
 
-	return monitor, nil
+	return &Monitor{
+		cfg:          cfg,
+		logger:       logger.With("component", ComponentName+"-rpc"),
+		clients:      clients,
+		db:           db,
+		pollInterval: cfg.PollInterval,
+		processor:    proc,
+	}, nil
 }
 
-func (m *Monitor) Start(ctx context.Context) error {
-
-	if m.cfg.InitDB {
-		if err := m.initDBTables(ctx); err != nil {
-			return err
+// Run starts the polling loop until ctx is cancelled.
+func (m *Monitor) Run(ctx context.Context) error {
+	// When backfill is disabled, record the current chain height as baseline FIRST
+	// We'll skip processing any blocks at or below this height
+	if !m.cfg.Backfill {
+		// Wait for block production to stabilize before setting baseline
+		// Poll until we see the same height twice in a row, or max 10 polls
+		var baseline, prevHeight int64
+		stableCount := 0
+		for i := 0; i < 10; i++ {
+			h, err := m.latestChainHeight(ctx)
+			if err != nil {
+				return err
+			}
+			if h > baseline {
+				baseline = h
+			}
+			// If height hasn't changed, we've reached stability
+			if h == prevHeight {
+				stableCount++
+				if stableCount >= 2 {
+					break
+				}
+			} else {
+				stableCount = 0
+			}
+			prevHeight = h
+			time.Sleep(m.pollInterval)
 		}
+		m.baselineMu.Lock()
+		m.baselineHeight = baseline
+		m.baselineMu.Unlock()
+		m.logger.Debug("backfill disabled, baseline set", "height", baseline)
 	}
-	var wg sync.WaitGroup
-	for _, node := range m.cfg.Nodes {
-		wg.Add(1)
-		go func(node string) {
-			defer wg.Done()
-			m.subscribeNode(ctx, node)
-		}(node)
-	}
-	<-ctx.Done()
-	wg.Wait() // Wait for all subscription goroutines to exit
-	m.logger.Info("Monitor stopped")
-	return nil
-}
 
-func (m *Monitor) IsReady() {
-	var count int
-	for range m.readyCh {
-		count++
-		if count == len(m.cfg.Nodes) {
-			return
-		}
+	nextHeight, err := m.startHeight(ctx)
+	if err != nil {
+		return err
 	}
-}
 
-func (m *Monitor) subscribeNode(ctx context.Context, node string) {
-	retryInterval := time.Second * 2
-	ticker := time.NewTicker(retryInterval)
+	m.logger.Debug("starting", "height", nextHeight)
+
+	ticker := time.NewTicker(m.pollInterval)
 	defer ticker.Stop()
 
-retryLoop:
 	for {
+		if err := m.catchUp(ctx, nextHeight); err != nil {
+			m.logger.Error("catch up failed", "error", err)
+		}
+		nextHeight++
+
 		select {
 		case <-ctx.Done():
-			return
-		default:
-			client, err := rpchttp.New(node, "/websocket")
-			if err != nil {
-				m.logger.Error("failed to create CometBFT RPC client", "node", node, "error", err)
-				<-ticker.C
-				continue
-			}
-
-			nodeCtx, nodeCancel := context.WithCancel(ctx)
-
-			if err := client.Start(); err != nil {
-				m.logger.Error("failed to start CometBFT RPC client", "node", node, "error", err)
-				nodeCancel()
-				<-ticker.C
-				continue
-			}
-			m.logger.Info("subscribed", "node", node+"/websocket")
-
-			query := ctypes.QueryForEvent(ctypes.EventNewBlockEvents).String()
-			eventCh, err := client.Subscribe(nodeCtx, ComponentName, query)
-			if err != nil {
-				m.logger.Error("failed to subscribe to NewBlock", "node", node, "error", err)
-				client.Stop()
-				nodeCancel()
-				<-ticker.C
-				continue
-			}
-
-			if m.runSubscription(ctx, node, nodeCtx, nodeCancel, client, eventCh, query) {
-				<-ticker.C
-				continue retryLoop
-			}
-			return
+			return ctx.Err()
+		case <-ticker.C:
 		}
 	}
 }
 
-func (m *Monitor) runSubscription(
-	ctx context.Context,
-	node string,
-	nodeCtx context.Context,
-	nodeCancel context.CancelFunc,
-	client *rpchttp.HTTP,
-	eventCh <-chan coretypes.ResultEvent,
-	query string,
-) bool {
-	var readyOnce sync.Once
-	nodeLogger := m.logger.With("node", node)
-	m.subsActive.Inc()
-
-	defer m.subsActive.Dec()
-	defer func() {
-		unsubscribeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-		if err := client.Unsubscribe(unsubscribeCtx, ComponentName, query); err != nil {
-			nodeLogger.Error("unsubscribing the client", "err", err)
-		}
-		cancel()
-		if err := client.Stop(); err != nil {
-			nodeLogger.Error("stopping client", "err", err)
-		}
-	}()
-
-	healthTicker := time.NewTicker(time.Second)
-	defer healthTicker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			nodeCancel()
-			return false
-		case <-nodeCtx.Done():
-			if ctx.Err() != nil {
-				return false
-			}
-			return true
-		case <-healthTicker.C:
-			statusCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-			_, err := client.Status(statusCtx)
-			readyOnce.Do(func() {
-				m.readyCh <- struct{}{}
-			})
-			cancel()
-			if err != nil {
-				nodeLogger.Error("subscription health check failed", "error", err)
-				nodeCancel()
-				return true
-			}
-		case msg, ok := <-eventCh:
-			nodeLogger.Debug("new event", "event", msg)
-			if !ok {
-				nodeLogger.Error("event channel closed")
-				nodeCancel()
-				return true
-			}
-			blockEv, ok := msg.Data.(ctypes.EventDataNewBlockEvents)
-			if !ok {
-				nodeLogger.Error("unexpected event type", "type", fmt.Sprintf("%T", msg.Data))
-				m.errCount.WithLabelValues("wrongEventType").Inc()
-				continue
-			}
-
-			if !m.shouldProcess(blockEv.Height) {
-				continue
-			}
-
-			m.handleNewBlock(ctx, nodeLogger, blockEv, query)
-		}
-	}
-}
-
-func (m *Monitor) handleNewBlock(ctx context.Context, logger log.Logger, blockEv ctypes.EventDataNewBlockEvents, query string) {
-	for _, ev := range blockEv.Events {
-		switch {
-		case ev.Type == "new_report":
-			report, err := DecodeReportEvent(blockEv.Height, ev)
-			if err != nil {
-				logger.Error("failed to decode report event", "error", err)
-				m.errCount.WithLabelValues("reportDecode").Inc()
-				continue
-			}
-			m.reportsCount.WithLabelValues(report.Reporter).Inc()
-			if err := m.storeReport(ctx, *report); err == nil {
-				logger.Debug("stored report", "query", query, "vals", report)
-				continue
-			}
-			logger.Error("failed to store report", "error", err)
-			m.errCount.WithLabelValues("reportInsert").Inc()
-		case ev.Type == "new_dispute":
-			if m.disputeEventHandler != nil {
-				m.disputeEventHandler.HandleDisputeEvent(ev)
-			}
-
-		default:
-			continue
-		}
-	}
-}
-
-const processedHeightsLimit = 1000
-
-func (m *Monitor) shouldProcess(height int64) bool {
-	m.mtx.Lock()
-	defer m.mtx.Unlock()
-
-	if _, seen := m.processedHeights[height]; seen {
-		return false
-	}
-
-	m.processedHeights[height] = struct{}{}
-	m.heightQueue = append(m.heightQueue, height)
-	if len(m.heightQueue) > processedHeightsLimit {
-		oldest := m.heightQueue[0]
-		m.heightQueue = m.heightQueue[1:]
-		delete(m.processedHeights, oldest)
-	}
-	return true
-}
-
-const (
-	reporterCol        = "reporter"
-	powerCol           = "power"
-	queryTypeCol       = "query_type"
-	queryIdCol         = "query_id"
-	aggregateMethodCol = "aggregate_method"
-	valueCol           = "value"
-	timestampCol       = "timestamp"
-	cyclelistCol       = "cyclelist"
-	blockNumberCol     = "block_number"
-	metaIdCol          = "meta_id"
-)
-
-func (m *Monitor) initDBTables(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	// If TableName is "db.table", create DB first.
-	if dot := strings.IndexByte(TableName, '.'); dot > 0 {
-		dbName := TableName[:dot]
-		if _, err := m.db.Exec(ctx, fmt.Sprintf(`CREATE DATABASE IF NOT EXISTS %s`, dbName)); err != nil {
-			return fmt.Errorf("create database: %w", err)
-		}
-	}
-
-	columnDefs := []string{
-		reporterCol + " LowCardinality(String)",
-		powerCol + " UInt64",
-		queryTypeCol + " LowCardinality(String)",
-		queryIdCol + " String",
-		aggregateMethodCol + " LowCardinality(String)",
-		valueCol + " String",
-		timestampCol + " DateTime64(3, 'UTC')",
-		cyclelistCol + " UInt8",
-		blockNumberCol + " UInt64",
-		metaIdCol + " UInt64",
-	}
-
-	// %[1]s = TableName
-	// %[2]s = joined column definitions
-	// %[3]s = timestampCol (partition key)
-	// %[4]s = blockNumberCol (sort key #1)
-	// %[5]s = queryIdCol (sort key #2)
-	query := fmt.Sprintf(`
-		CREATE TABLE IF NOT EXISTS %[1]s (
-		%[2]s
-		)
-		ENGINE = MergeTree
-		PARTITION BY toYYYYMM(%[3]s)     -- partition by time ( %[3]s )
-		ORDER BY (%[4]s, %[5]s)          -- sort key: height then query id ( %[4]s, %[5]s )
-		SETTINGS index_granularity = 8192
-		`,
-		TableName,
-		strings.Join(columnDefs, ",\n  "),
-		timestampCol,
-		blockNumberCol,
-		queryIdCol,
-	)
-
-	_, err := m.db.Exec(ctx, query)
-
-	m.logger.Info("created db table", "query", query)
-
-	return err
-}
-
-func (m *Monitor) storeReport(ctx context.Context, r types.MicroReport) error {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
-	defer cancel()
-
-	var cycle uint8
-	if r.Cyclelist {
-		cycle = 1
-	}
-
-	type columnVal struct {
-		name string
-		val  any
-	}
-	queryIDHex, err := EncodeQueryID(r.QueryId)
+func (m *Monitor) catchUp(ctx context.Context, nextHeight int64) error {
+	latest, err := m.latestChainHeight(ctx)
 	if err != nil {
 		return err
 	}
 
-	cols := []columnVal{
-		{name: reporterCol, val: r.Reporter},
-		{name: powerCol, val: r.Power},
-		{name: queryTypeCol, val: r.QueryType},
-		{name: queryIdCol, val: queryIDHex},
-		{name: aggregateMethodCol, val: r.AggregateMethod},
-		{name: valueCol, val: r.Value},
-		{name: timestampCol, val: r.Timestamp},
-		{name: cyclelistCol, val: cycle},
-		{name: blockNumberCol, val: r.BlockNumber},
-		{name: metaIdCol, val: r.MetaId},
+	m.logger.Debug("chain height", "num", latest)
+	if latest < nextHeight {
+		return nil
 	}
 
-	var colNames []string
-	var vals []any
-	for _, cv := range cols {
-		colNames = append(colNames, cv.name)
-		vals = append(vals, cv.val)
+	// When backfill is disabled, skip blocks at or below baseline
+	if !m.cfg.Backfill {
+		m.baselineMu.Lock()
+		baseline := m.baselineHeight
+		m.baselineMu.Unlock()
+
+		if latest <= baseline {
+			// All available blocks are historical, skip them
+			m.logger.Debug("skipping historical blocks", "latest", latest, "baseline", baseline)
+			return nil
+		}
+
+		// Start from first block after baseline
+		if nextHeight <= baseline {
+			nextHeight = baseline + 1
+			m.logger.Debug("adjusting start height past baseline", "newStart", nextHeight, "baseline", baseline)
+		}
 	}
 
-	query := fmt.Sprintf(
-		"INSERT INTO %s (%s) VALUES (%s)",
-		TableName,
-		strings.Join(colNames, ", "),
-		strings.TrimRight(strings.Repeat("?, ", len(colNames)), ", "),
-	)
-
-	if _, err := m.db.Exec(ctx, query, vals...); err != nil {
-		return err
+	// Try to detect the chain's initial height by attempting to fetch nextHeight
+	// If it fails with "lowest height is X", jump to X
+	_, err = m.fetchBlock(ctx, nextHeight)
+	if err != nil && strings.Contains(err.Error(), "is not available, lowest height is") {
+		parts := strings.Split(err.Error(), "lowest height is ")
+		if len(parts) == 2 {
+			var lowestHeight int64
+			fmt.Sscanf(parts[1], "%d", &lowestHeight)
+			if lowestHeight > nextHeight {
+				m.logger.Debug("jumping to chain's initial height", "from", nextHeight, "to", lowestHeight)
+				nextHeight = lowestHeight
+			}
+		}
 	}
 
-	m.reportCount.Inc()
-
+	for h := nextHeight; h <= latest; h++ {
+		event, err := m.fetchBlock(ctx, h)
+		if err != nil {
+			// Skip blocks that can't be fetched (empty blocks in test environments)
+			if strings.Contains(err.Error(), "could not find results") {
+				m.logger.Debug("skipping block with no results", "height", h)
+				continue
+			}
+			return fmt.Errorf("fetch block %d: %w", h, err)
+		}
+		m.processor.ProcessBlock(ctx, event)
+	}
 	return nil
 }
 
-// ParseTimestamp parses timestamps stored on chain into UTC time.
-func ParseTimestamp(val string) (time.Time, error) {
-	if ts, err := time.Parse(time.RFC3339Nano, val); err == nil {
-		return ts.UTC(), nil
-	}
-	ms, err := strconv.ParseInt(val, 10, 64)
+func (m *Monitor) startHeight(ctx context.Context) (int64, error) {
+	last, err := m.lastStoredHeight(ctx)
 	if err != nil {
-		return time.Time{}, err
+		return 0, err
 	}
-	return time.UnixMilli(ms).UTC(), nil
+	// Start from last stored height + 1
+	// When backfill is disabled, catchUp will skip historical blocks
+	return last + 1, nil
 }
 
-// ParseReporterPower parses the reporter power column.
-func ParseReporterPower(val string) (uint64, error) {
-	return parseUint64(val)
-}
-
-// ParseBlockNumber parses the block_number column.
-func ParseBlockNumber(val string) (uint64, error) {
-	return parseUint64(val)
-}
-
-// ParseMetaID parses the meta_id column.
-func ParseMetaID(val string) (uint64, error) {
-	return parseUint64(val)
-}
-
-// parseUint64 converts decimal strings to uint64.
-func parseUint64(val string) (uint64, error) {
-	return strconv.ParseUint(val, 10, 64)
-}
-
-// EncodeQueryID converts 32-byte query IDs to a hex string.
-func EncodeQueryID(queryID []byte) (string, error) {
-	if len(queryID) != 32 {
-		return "", fmt.Errorf("query_id must be 32 bytes, got %d", len(queryID))
+func (m *Monitor) lastStoredHeight(ctx context.Context) (int64, error) {
+	query := fmt.Sprintf("SELECT COALESCE(MAX(block_height), 0) FROM %s", db.TableNameTxs)
+	rows, err := m.db.Query(ctx, query)
+	if err != nil {
+		return 0, err
 	}
-	return hex.EncodeToString(queryID), nil
-}
+	defer rows.Close()
 
-// DecodeQueryID converts a hex string query ID to bytes.
-func DecodeQueryID(val string) ([]byte, error) {
-	if val == "" {
-		return nil, fmt.Errorf("query_id is empty")
-	}
-
-	return hex.DecodeString(val)
-}
-
-// DecodeReportEvent extracts a MicroReport from a CometBFT event payload.
-func DecodeReportEvent(height int64, ev abci.Event) (*types.MicroReport, error) {
-	var report types.MicroReport
-
-	for _, attr := range ev.Attributes {
-		attrVal := attr.Value
-		switch attr.Key {
-		case reporterCol:
-			report.Reporter = attrVal
-		case powerCol, "reporter_power":
-			power, err := ParseReporterPower(attrVal)
-			if err != nil {
-				return nil, fmt.Errorf("parse reporter power: %w", err)
-			}
-			report.Power = power
-		case queryTypeCol:
-			report.QueryType = attrVal
-		case queryIdCol:
-			queryIDBytes, err := DecodeQueryID(attrVal)
-			if err != nil {
-				return nil, fmt.Errorf("decode query_id: %w", err)
-			}
-			report.QueryId = queryIDBytes
-		case aggregateMethodCol:
-			report.AggregateMethod = attrVal
-		case valueCol:
-			report.Value = attrVal
-		case timestampCol:
-			ts, err := ParseTimestamp(attrVal)
-			if err != nil {
-				return nil, fmt.Errorf("parse timestamp: %w", err)
-			}
-			report.Timestamp = ts
-		case cyclelistCol:
-			report.Cyclelist = attrVal == "true"
-		case blockNumberCol:
-			blockNumber, err := ParseBlockNumber(attrVal)
-			if err != nil {
-				return nil, fmt.Errorf("parse block number: %w", err)
-			}
-			report.BlockNumber = blockNumber
-
-			if report.BlockNumber == 0 && height > 0 {
-				report.BlockNumber = uint64(height)
-			}
-		case metaIdCol:
-			metaId, err := ParseMetaID(attrVal)
-			if err != nil {
-				return nil, fmt.Errorf("parse meta_id: %w", err)
-			}
-			report.MetaId = metaId
+	var height sql.NullInt64
+	if rows.Next() {
+		if err := rows.Scan(&height); err != nil {
+			return 0, err
 		}
 	}
+	if !height.Valid {
+		return 0, nil
+	}
+	return height.Int64, nil
+}
 
-	return &report, nil
+func (m *Monitor) latestChainHeight(ctx context.Context) (int64, error) {
+	type res struct {
+		height int64
+		err    error
+	}
+	resCh := make(chan res, len(m.clients))
+	var wg sync.WaitGroup
+	for _, client := range m.clients {
+		wg.Add(1)
+		go func(cli *rpchttp.HTTP) {
+			defer wg.Done()
+			resp, err := cli.ABCIInfo(ctx)
+			if err != nil {
+				resCh <- res{err: err}
+				return
+			}
+			resCh <- res{height: resp.Response.LastBlockHeight}
+		}(client)
+	}
+
+	var firstErr error
+	for i := 0; i < len(m.clients); i++ {
+		select {
+		case r := <-resCh:
+			if r.err == nil {
+				return r.height, nil
+			}
+			if firstErr == nil {
+				firstErr = r.err
+			}
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return 0, firstErr
+	}
+	return 0, errors.New("unable to query any node")
+}
+
+func (m *Monitor) fetchBlock(ctx context.Context, height int64) (ctypes.EventDataNewBlock, error) {
+	type res struct {
+		event ctypes.EventDataNewBlock
+		err   error
+	}
+	resCh := make(chan res, len(m.clients))
+	var wg sync.WaitGroup
+	for _, client := range m.clients {
+		wg.Add(1)
+		go func(cli *rpchttp.HTTP) {
+			defer wg.Done()
+			blockRes, err := cli.Block(ctx, &height)
+			if err != nil {
+				resCh <- res{err: err}
+				return
+			}
+			resultsRes, err := cli.BlockResults(ctx, &height)
+			if err != nil {
+				resCh <- res{err: err}
+				return
+			}
+			event := ctypes.EventDataNewBlock{
+				Block:               blockRes.Block,
+				BlockID:             blockRes.BlockID,
+				ResultFinalizeBlock: finalizeToResponse(resultsRes),
+			}
+			resCh <- res{event: event}
+		}(client)
+	}
+
+	var firstErr error
+	for i := 0; i < len(m.clients); i++ {
+		select {
+		case r := <-resCh:
+			if r.err == nil && r.event.Block != nil {
+				return r.event, nil
+			}
+			if firstErr == nil {
+				firstErr = r.err
+			}
+		case <-ctx.Done():
+			return ctypes.EventDataNewBlock{}, ctx.Err()
+		}
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return ctypes.EventDataNewBlock{}, firstErr
+	}
+	return ctypes.EventDataNewBlock{}, errors.New("no block data available")
+}
+
+func finalizeToResponse(results *coretypes.ResultBlockResults) abci.ResponseFinalizeBlock {
+	if results == nil {
+		return abci.ResponseFinalizeBlock{}
+	}
+
+	resp := abci.ResponseFinalizeBlock{
+		Events:                results.FinalizeBlockEvents,
+		TxResults:             results.TxsResults,
+		ValidatorUpdates:      results.ValidatorUpdates,
+		ConsensusParamUpdates: results.ConsensusParamUpdates,
+		AppHash:               results.AppHash,
+	}
+
+	return resp
 }
