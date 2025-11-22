@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -82,14 +81,12 @@ func New(ctx context.Context, logger log.Logger, cfg Config, reg prometheus.Regi
 
 // Run starts the polling loop until ctx is cancelled.
 func (m *Monitor) Run(ctx context.Context) error {
-	// When backfill is disabled, record the current chain height as baseline FIRST
-	// We'll skip processing any blocks at or below this height
+	// When backfill is disabled, set the baseline height to determine which blocks to skip.
+	// We poll multiple times to ensure we capture the highest block that exists before monitoring starts.
+	// This prevents edge cases where a block is produced between our initial check and when we start polling.
 	if !m.cfg.Backfill {
-		// Wait for block production to stabilize before setting baseline
-		// Poll until we see the same height twice in a row, or max 10 polls
-		var baseline, prevHeight int64
-		stableCount := 0
-		for i := 0; i < 10; i++ {
+		var baseline int64
+		for i := 0; i < 3; i++ {
 			h, err := m.latestChainHeight(ctx)
 			if err != nil {
 				return err
@@ -97,16 +94,6 @@ func (m *Monitor) Run(ctx context.Context) error {
 			if h > baseline {
 				baseline = h
 			}
-			// If height hasn't changed, we've reached stability
-			if h == prevHeight {
-				stableCount++
-				if stableCount >= 2 {
-					break
-				}
-			} else {
-				stableCount = 0
-			}
-			prevHeight = h
 			time.Sleep(m.pollInterval)
 		}
 		m.baselineMu.Lock()
@@ -169,29 +156,9 @@ func (m *Monitor) catchUp(ctx context.Context, nextHeight int64) error {
 		}
 	}
 
-	// Try to detect the chain's initial height by attempting to fetch nextHeight
-	// If it fails with "lowest height is X", jump to X
-	_, err = m.fetchBlock(ctx, nextHeight)
-	if err != nil && strings.Contains(err.Error(), "is not available, lowest height is") {
-		parts := strings.Split(err.Error(), "lowest height is ")
-		if len(parts) == 2 {
-			var lowestHeight int64
-			fmt.Sscanf(parts[1], "%d", &lowestHeight)
-			if lowestHeight > nextHeight {
-				m.logger.Debug("jumping to chain's initial height", "from", nextHeight, "to", lowestHeight)
-				nextHeight = lowestHeight
-			}
-		}
-	}
-
 	for h := nextHeight; h <= latest; h++ {
 		event, err := m.fetchBlock(ctx, h)
 		if err != nil {
-			// Skip blocks that can't be fetched (empty blocks in test environments)
-			if strings.Contains(err.Error(), "could not find results") {
-				m.logger.Debug("skipping block with no results", "height", h)
-				continue
-			}
 			return fmt.Errorf("fetch block %d: %w", h, err)
 		}
 		m.processor.ProcessBlock(ctx, event)

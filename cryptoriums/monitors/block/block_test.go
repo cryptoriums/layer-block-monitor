@@ -34,6 +34,10 @@ func TestBackfill(t *testing.T) {
 		require.NoError(t, err)
 		defer func() { _ = sqlDB.Close() }()
 
+		// Clean up tables at START of test to ensure isolation
+		_, _ = sqlDB.Exec("DROP TABLE IF EXISTS txs")
+		_, _ = sqlDB.Exec("DROP TABLE IF EXISTS blocks")
+
 		wrappedDB, err := blockdb.New(ctx, sqlDB)
 		require.NoError(t, err)
 
@@ -107,6 +111,10 @@ func TestBackfill(t *testing.T) {
 		require.NoError(t, err)
 		defer func() { _ = sqlDB.Close() }()
 
+		// Clean up tables at START of test to ensure isolation
+		_, _ = sqlDB.Exec("DROP TABLE IF EXISTS txs")
+		_, _ = sqlDB.Exec("DROP TABLE IF EXISTS blocks")
+
 		wrappedDB, err := blockdb.New(ctx, sqlDB)
 		require.NoError(t, err)
 
@@ -156,14 +164,13 @@ func TestBackfill(t *testing.T) {
 			}
 		})
 
-		// Wait a bit for monitor to start
-		time.Sleep(1 * time.Second)
-
 		// With backfill disabled, monitor should skip historical blocks
 		// and only process new blocks (which won't come in this test)
-		// So we expect 0 reports
-		actual := fetchReportsFromDB(t, sqlDB)
-		require.Equal(t, 0, len(actual), "backfill disabled should not process historical blocks")
+		// Verify that no reports are processed even after waiting
+		require.Never(t, func() bool {
+			actual := fetchReportsFromDB(t, sqlDB)
+			return len(actual) > 0
+		}, 2*time.Second, 200*time.Millisecond, "backfill disabled should not process any historical blocks")
 
 		cancel() // Stop the monitor
 	})
@@ -233,6 +240,10 @@ func TestDeduplication(t *testing.T) {
 			require.NoError(t, err)
 			defer func() { _ = sqlDB.Close() }()
 
+			// Clean up tables at START of test to ensure isolation
+			_, _ = sqlDB.Exec("DROP TABLE IF EXISTS txs")
+			_, _ = sqlDB.Exec("DROP TABLE IF EXISTS blocks")
+
 			wrappedDB, err := blockdb.New(ctx, sqlDB)
 			require.NoError(t, err)
 
@@ -291,6 +302,10 @@ func TestDeduplication(t *testing.T) {
 			actualReports := sortReports(t, copyReports(fetchReportsFromDB(t, sqlDB)))
 			expectedSorted := sortReports(t, copyReports(expected))
 			require.Equal(t, expectedSorted, actualReports)
+
+			// Clean up tables after test
+			_, _ = sqlDB.Exec("DROP TABLE IF EXISTS txs")
+			_, _ = sqlDB.Exec("DROP TABLE IF EXISTS blocks")
 		})
 	}
 }
