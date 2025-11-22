@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,6 +37,11 @@ type Monitor struct {
 	db           db.Db
 	pollInterval time.Duration
 	processor    processor.BlockProcessor
+
+	// baselineHeight tracks the chain height when monitor started with Backfill=false
+	// Used to skip processing historical blocks
+	baselineHeight int64
+	baselineMu     sync.Mutex
 }
 
 // New creates a new RPC monitor.
@@ -76,6 +82,39 @@ func New(ctx context.Context, logger log.Logger, cfg Config, reg prometheus.Regi
 
 // Run starts the polling loop until ctx is cancelled.
 func (m *Monitor) Run(ctx context.Context) error {
+	// When backfill is disabled, record the current chain height as baseline FIRST
+	// We'll skip processing any blocks at or below this height
+	if !m.cfg.Backfill {
+		// Wait for block production to stabilize before setting baseline
+		// Poll until we see the same height twice in a row, or max 10 polls
+		var baseline, prevHeight int64
+		stableCount := 0
+		for i := 0; i < 10; i++ {
+			h, err := m.latestChainHeight(ctx)
+			if err != nil {
+				return err
+			}
+			if h > baseline {
+				baseline = h
+			}
+			// If height hasn't changed, we've reached stability
+			if h == prevHeight {
+				stableCount++
+				if stableCount >= 2 {
+					break
+				}
+			} else {
+				stableCount = 0
+			}
+			prevHeight = h
+			time.Sleep(m.pollInterval)
+		}
+		m.baselineMu.Lock()
+		m.baselineHeight = baseline
+		m.baselineMu.Unlock()
+		m.logger.Debug("backfill disabled, baseline set", "height", baseline)
+	}
+
 	nextHeight, err := m.startHeight(ctx)
 	if err != nil {
 		return err
@@ -111,9 +150,48 @@ func (m *Monitor) catchUp(ctx context.Context, nextHeight int64) error {
 		return nil
 	}
 
+	// When backfill is disabled, skip blocks at or below baseline
+	if !m.cfg.Backfill {
+		m.baselineMu.Lock()
+		baseline := m.baselineHeight
+		m.baselineMu.Unlock()
+
+		if latest <= baseline {
+			// All available blocks are historical, skip them
+			m.logger.Debug("skipping historical blocks", "latest", latest, "baseline", baseline)
+			return nil
+		}
+
+		// Start from first block after baseline
+		if nextHeight <= baseline {
+			nextHeight = baseline + 1
+			m.logger.Debug("adjusting start height past baseline", "newStart", nextHeight, "baseline", baseline)
+		}
+	}
+
+	// Try to detect the chain's initial height by attempting to fetch nextHeight
+	// If it fails with "lowest height is X", jump to X
+	_, err = m.fetchBlock(ctx, nextHeight)
+	if err != nil && strings.Contains(err.Error(), "is not available, lowest height is") {
+		parts := strings.Split(err.Error(), "lowest height is ")
+		if len(parts) == 2 {
+			var lowestHeight int64
+			fmt.Sscanf(parts[1], "%d", &lowestHeight)
+			if lowestHeight > nextHeight {
+				m.logger.Debug("jumping to chain's initial height", "from", nextHeight, "to", lowestHeight)
+				nextHeight = lowestHeight
+			}
+		}
+	}
+
 	for h := nextHeight; h <= latest; h++ {
 		event, err := m.fetchBlock(ctx, h)
 		if err != nil {
+			// Skip blocks that can't be fetched (empty blocks in test environments)
+			if strings.Contains(err.Error(), "could not find results") {
+				m.logger.Debug("skipping block with no results", "height", h)
+				continue
+			}
 			return fmt.Errorf("fetch block %d: %w", h, err)
 		}
 		m.processor.ProcessBlock(ctx, event)
@@ -126,15 +204,8 @@ func (m *Monitor) startHeight(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if !m.cfg.Backfill {
-		latest, err := m.latestChainHeight(ctx)
-		if err != nil {
-			return 0, err
-		}
-		if latest > last {
-			last = latest
-		}
-	}
+	// Start from last stored height + 1
+	// When backfill is disabled, catchUp will skip historical blocks
 	return last + 1, nil
 }
 

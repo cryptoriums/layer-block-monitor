@@ -173,12 +173,15 @@ type testApp struct {
 	kvstore.Application
 	t *testing.T
 
-	mu            sync.Mutex
-	currentHeight int64
+	mu              sync.Mutex
+	currentHeight   int64
+	committedHeight int64
 
 	payloadMu sync.Mutex
 	payloads  map[int64]ctypes.EventDataNewBlock
 	notifyCh  chan struct{}
+	minHeight int64
+	maxHeight int64
 }
 
 func newTestApp(t *testing.T) *testApp {
@@ -202,6 +205,12 @@ func (app *testApp) SetBatch(blocks []ctypes.EventDataNewBlock) {
 		}
 		height := block.Block.Header.Height
 		app.payloads[height] = block
+		if app.minHeight == 0 || height < app.minHeight {
+			app.minHeight = height
+		}
+		if height > app.maxHeight {
+			app.maxHeight = height
+		}
 	}
 	app.payloadMu.Unlock()
 	app.signal()
@@ -213,10 +222,24 @@ func (app *testApp) CurrentHeight() int64 {
 	return app.currentHeight
 }
 
+func (app *testApp) Info(ctx context.Context, req *abci.RequestInfo) (*abci.ResponseInfo, error) {
+	app.mu.Lock()
+	height := app.committedHeight
+	app.mu.Unlock()
+
+	return &abci.ResponseInfo{
+		LastBlockHeight:  height,
+		LastBlockAppHash: []byte("test-app-hash"),
+	}, nil
+}
+
 func (app *testApp) FinalizeBlock(ctx context.Context, req *abci.RequestFinalizeBlock) (*abci.ResponseFinalizeBlock, error) {
 	app.mu.Lock()
 	app.currentHeight = int64(req.Height)
 	app.mu.Unlock()
+
+	// Slow down block production to give monitor time to catch up
+	time.Sleep(100 * time.Millisecond)
 
 	payload, err := app.waitForPayload(ctx, int64(req.Height))
 	if err != nil {
@@ -228,6 +251,22 @@ func (app *testApp) FinalizeBlock(ctx context.Context, req *abci.RequestFinalize
 		return &abci.ResponseFinalizeBlock{}, nil
 	}
 	resp := payload.ResultFinalizeBlock
+
+	// FIX #1: Ensure TxResults length matches the number of transactions
+	expectedTxCount := len(req.Txs)
+	if len(resp.TxResults) != expectedTxCount {
+		if len(resp.TxResults) > expectedTxCount {
+			resp.TxResults = resp.TxResults[:expectedTxCount]
+		} else {
+			for len(resp.TxResults) < expectedTxCount {
+				resp.TxResults = append(resp.TxResults, &abci.ExecTxResult{})
+			}
+		}
+	}
+
+	// FIX #2: Clear ConsensusParamUpdates to avoid consensus failures
+	resp.ConsensusParamUpdates = nil
+
 	return &resp, nil
 }
 
@@ -247,11 +286,24 @@ func (app *testApp) CheckTx(context.Context, *abci.RequestCheckTx) (*abci.Respon
 	return &abci.ResponseCheckTx{Code: kvstore.CodeTypeOK, GasWanted: 1}, nil
 }
 
-func (app *testApp) Commit(context.Context, *abci.RequestCommit) (*abci.ResponseCommit, error) {
+func (app *testApp) Commit(ctx context.Context, req *abci.RequestCommit) (*abci.ResponseCommit, error) {
+	// FIX #3: Update committed height for Info() queries
+	// Don't call parent kvstore.Commit() - it expects different tx format
+	app.mu.Lock()
+	app.committedHeight = app.currentHeight
+	app.mu.Unlock()
 	return &abci.ResponseCommit{}, nil
 }
 
 func (app *testApp) waitForPayload(ctx context.Context, height int64) (ctypes.EventDataNewBlock, error) {
+	// If height is outside our fixture range, return empty block immediately
+	app.payloadMu.Lock()
+	if height > app.maxHeight {
+		app.payloadMu.Unlock()
+		return ctypes.EventDataNewBlock{}, nil
+	}
+	app.payloadMu.Unlock()
+
 	for {
 		app.payloadMu.Lock()
 		payload, ok := app.payloads[height]

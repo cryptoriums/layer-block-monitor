@@ -19,8 +19,162 @@ import (
 // For all tests use only public module functions.
 // For matching exp vs act, use the db or the prometheus metrics.
 
-// TODO
 func TestBackfill(t *testing.T) {
+	fixtures := loadFixtures(t)
+	require.NotEmpty(t, fixtures)
+
+	expected := extractExpectedReports(t, fixtures)
+	require.NotEmpty(t, expected)
+
+	t.Run("backfill enabled processes all blocks", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		sqlDB, err := sql.Open("chdb", "")
+		require.NoError(t, err)
+		defer func() { _ = sqlDB.Close() }()
+
+		// Clean up tables at START of test to ensure isolation
+		_, _ = sqlDB.Exec("DROP TABLE IF EXISTS txs")
+		_, _ = sqlDB.Exec("DROP TABLE IF EXISTS blocks")
+
+		wrappedDB, err := blockdb.New(ctx, sqlDB)
+		require.NoError(t, err)
+
+		// Setup node with all fixture blocks
+		app := newTestApp(t)
+		app.SetBatch(fixtures)
+
+		cfg := rpctest.GetConfig(true)
+		genDoc, err := ctypes.GenesisDocFromFile(cfg.GenesisFile())
+		require.NoError(t, err)
+		genDoc.InitialHeight = fixtureHeight(fixtures[0])
+		require.NoError(t, genDoc.SaveAs(cfg.GenesisFile()))
+
+		node := rpctest.StartTendermint(app)
+		t.Cleanup(func() {
+			rpctest.StopTendermint(node)
+		})
+
+		// Monitor with Backfill enabled
+		rpcCfg := Config{
+			Nodes:        []string{node.Config().RPC.ListenAddress},
+			Backfill:     true,
+			PollInterval: 200 * time.Millisecond,
+		}
+
+		monitor, err := New(
+			ctx,
+			cryptolog.New(),
+			rpcCfg,
+			prometheus.NewRegistry(),
+			wrappedDB,
+		)
+		require.NoError(t, err)
+
+		runErr := make(chan error, 1)
+		go func() {
+			runErr <- monitor.Run(ctx)
+		}()
+		t.Cleanup(func() {
+			select {
+			case err := <-runErr:
+				if err != nil && err != context.Canceled {
+					t.Fatalf("monitor run failed: %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatalf("monitor did not stop")
+			}
+		})
+
+		// Verify all reports are stored
+		expectedCount := len(expected)
+		require.Eventually(t, func() bool {
+			actual := fetchReportsFromDB(t, sqlDB)
+			return len(actual) == expectedCount
+		}, 5*time.Second, 200*time.Millisecond, "backfill should store all %d reports, got %d", expectedCount, len(fetchReportsFromDB(t, sqlDB)))
+
+		actualReports := sortReports(t, copyReports(fetchReportsFromDB(t, sqlDB)))
+		expectedSorted := sortReports(t, copyReports(expected))
+		require.Equal(t, expectedSorted, actualReports)
+
+		// Clean up tables after test
+		_, _ = sqlDB.Exec("DROP TABLE IF EXISTS txs")
+		_, _ = sqlDB.Exec("DROP TABLE IF EXISTS blocks")
+	})
+
+	t.Run("backfill disabled skips historical blocks", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		sqlDB, err := sql.Open("chdb", "")
+		require.NoError(t, err)
+		defer func() { _ = sqlDB.Close() }()
+
+		// Clean up tables at START of test to ensure isolation
+		_, _ = sqlDB.Exec("DROP TABLE IF EXISTS txs")
+		_, _ = sqlDB.Exec("DROP TABLE IF EXISTS blocks")
+
+		wrappedDB, err := blockdb.New(ctx, sqlDB)
+		require.NoError(t, err)
+
+		// Setup node with all fixture blocks
+		app := newTestApp(t)
+		app.SetBatch(fixtures)
+
+		cfg := rpctest.GetConfig(true)
+		genDoc, err := ctypes.GenesisDocFromFile(cfg.GenesisFile())
+		require.NoError(t, err)
+		genDoc.InitialHeight = fixtureHeight(fixtures[0])
+		require.NoError(t, genDoc.SaveAs(cfg.GenesisFile()))
+
+		node := rpctest.StartTendermint(app)
+		t.Cleanup(func() {
+			rpctest.StopTendermint(node)
+		})
+
+		// Monitor with Backfill disabled
+		rpcCfg := Config{
+			Nodes:        []string{node.Config().RPC.ListenAddress},
+			Backfill:     false, // Disabled
+			PollInterval: 200 * time.Millisecond,
+		}
+
+		monitor, err := New(
+			ctx,
+			cryptolog.New(),
+			rpcCfg,
+			prometheus.NewRegistry(),
+			wrappedDB,
+		)
+		require.NoError(t, err)
+
+		runErr := make(chan error, 1)
+		go func() {
+			runErr <- monitor.Run(ctx)
+		}()
+		t.Cleanup(func() {
+			select {
+			case err := <-runErr:
+				if err != nil && err != context.Canceled {
+					t.Fatalf("monitor run failed: %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatalf("monitor did not stop")
+			}
+		})
+
+		// Wait a bit for monitor to start
+		time.Sleep(1 * time.Second)
+
+		// With backfill disabled, monitor should skip historical blocks
+		// and only process new blocks (which won't come in this test)
+		// So we expect 0 reports
+		actual := fetchReportsFromDB(t, sqlDB)
+		require.Equal(t, 0, len(actual), "backfill disabled should not process historical blocks")
+
+		cancel() // Stop the monitor
+	})
 }
 
 func TestDeduplication(t *testing.T) {
@@ -87,6 +241,10 @@ func TestDeduplication(t *testing.T) {
 			require.NoError(t, err)
 			defer func() { _ = sqlDB.Close() }()
 
+			// Clean up tables at START of test to ensure isolation
+			_, _ = sqlDB.Exec("DROP TABLE IF EXISTS txs")
+			_, _ = sqlDB.Exec("DROP TABLE IF EXISTS blocks")
+
 			wrappedDB, err := blockdb.New(ctx, sqlDB)
 			require.NoError(t, err)
 
@@ -122,7 +280,7 @@ func TestDeduplication(t *testing.T) {
 
 			runErr := make(chan error, 1)
 			go func() {
-				time.Sleep(2 * time.Second)
+// 				time.Sleep(2 * time.Second)
 				runErr <- monitor.Run(ctx)
 			}()
 			t.Cleanup(func() {
@@ -145,6 +303,10 @@ func TestDeduplication(t *testing.T) {
 			actualReports := sortReports(t, copyReports(fetchReportsFromDB(t, sqlDB)))
 			expectedSorted := sortReports(t, copyReports(expected))
 			require.Equal(t, expectedSorted, actualReports)
+
+			// Clean up tables after test
+			_, _ = sqlDB.Exec("DROP TABLE IF EXISTS txs")
+			_, _ = sqlDB.Exec("DROP TABLE IF EXISTS blocks")
 		})
 	}
 }
