@@ -10,6 +10,7 @@ import (
 	rpchttp "github.com/cometbft/cometbft/rpc/client/http"
 	"github.com/spf13/viper"
 	globalfeetypes "github.com/strangelove-ventures/globalfee/x/globalfee/types"
+	"github.com/tellor-io/layer/cryptoriums/wallet"
 	customquery "github.com/tellor-io/layer/daemons/custom_query"
 	"github.com/tellor-io/layer/daemons/flags"
 	pricefeedtypes "github.com/tellor-io/layer/daemons/pricefeed/client/types"
@@ -160,7 +161,12 @@ func (c *Client) Start(
 	encodingConfig := CreateEncodingConfig()
 	c.cosmosCtx = c.cosmosCtx.WithCodec(encodingConfig.Codec).WithInterfaceRegistry(encodingConfig.InterfaceRegistry).WithTxConfig(encodingConfig.TxConfig)
 
-	kr, err := keyring.New("", kb, homeDir, nil, encodingConfig.Codec)
+	reader, err := wallet.Reader(ctx, c.logger, encodingConfig.Codec)
+	if err != nil {
+		return nil, err
+	}
+
+	kr, err := keyring.New("", kb, homeDir, reader, encodingConfig.Codec)
 	if err != nil {
 		return err
 	}

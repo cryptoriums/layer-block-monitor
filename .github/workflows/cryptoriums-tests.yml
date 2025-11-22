@@ -1,0 +1,27 @@
+name: Cryptoriums Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version-file: go.mod
+
+      - name: Install chdb dependency
+        run: curl -sL https://lib.chdb.io | bash
+
+      - name: Run cryptoriums tests (excluding tools)
+        run: |
+          pkgs=$(go list ./cryptoriums/... | grep -v '/tools')
+          if [ -n "$pkgs" ]; then
+            go test -v $pkgs
+          fi

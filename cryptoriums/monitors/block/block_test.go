@@ -34,6 +34,10 @@ func TestBackfill(t *testing.T) {
 		require.NoError(t, err)
 		defer func() { _ = sqlDB.Close() }()
 
+		// Clean up tables at START of test to ensure isolation
+		_, _ = sqlDB.Exec("DROP TABLE IF EXISTS txs")
+		_, _ = sqlDB.Exec("DROP TABLE IF EXISTS blocks")
+
 		wrappedDB, err := blockdb.New(ctx, sqlDB)
 		require.NoError(t, err)
 
@@ -106,6 +110,10 @@ func TestBackfill(t *testing.T) {
 		sqlDB, err := sql.Open("chdb", "")
 		require.NoError(t, err)
 		defer func() { _ = sqlDB.Close() }()
+
+		// Clean up tables at START of test to ensure isolation
+		_, _ = sqlDB.Exec("DROP TABLE IF EXISTS txs")
+		_, _ = sqlDB.Exec("DROP TABLE IF EXISTS blocks")
 
 		wrappedDB, err := blockdb.New(ctx, sqlDB)
 		require.NoError(t, err)
@@ -233,6 +241,10 @@ func TestDeduplication(t *testing.T) {
 			require.NoError(t, err)
 			defer func() { _ = sqlDB.Close() }()
 
+			// Clean up tables at START of test to ensure isolation
+			_, _ = sqlDB.Exec("DROP TABLE IF EXISTS txs")
+			_, _ = sqlDB.Exec("DROP TABLE IF EXISTS blocks")
+
 			wrappedDB, err := blockdb.New(ctx, sqlDB)
 			require.NoError(t, err)
 
@@ -291,6 +303,10 @@ func TestDeduplication(t *testing.T) {
 			actualReports := sortReports(t, copyReports(fetchReportsFromDB(t, sqlDB)))
 			expectedSorted := sortReports(t, copyReports(expected))
 			require.Equal(t, expectedSorted, actualReports)
+
+			// Clean up tables after test
+			_, _ = sqlDB.Exec("DROP TABLE IF EXISTS txs")
+			_, _ = sqlDB.Exec("DROP TABLE IF EXISTS blocks")
 		})
 	}
 }

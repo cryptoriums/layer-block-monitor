@@ -84,6 +84,7 @@ func NewRootCmd(
 				return err
 			}
 
+			app.StartCtx = cmd.Context()
 			customAppTemplate, customAppConfig := initAppConfig()
 			customTMConfig := initTendermintConfig()
 			return server.InterceptConfigsPreRunHandler(
